@@ -1,0 +1,31 @@
+# === Generated pipeline outputs ===
+final_animation.fbx
+temp_motion.bvh
+
+# === HY-Motion-1.0 (cloned repo with multi-GB checkpoints) ===
+HY-Motion-1.0/
+
+# === Ollama installation (binaries + CUDA/ROCm runtime DLLs) ===
+lib/
+*.exe
+app.ico
+unins000.*
+
+# === Docker persistent volumes (Milvus data) ===
+volumes/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+mcp_server/venv/
+
+# === Claude Code project data ===
+.claude/
+
+# === OS / IDE ===
+.vs/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
