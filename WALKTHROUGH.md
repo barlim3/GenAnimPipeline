@@ -157,7 +157,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 
 ### 1. Clone and Pull Real Assets
 
-1. Clone the HY-Motion 1.0 Repository to your Windows drive via WSL2 (e.g., `/mnt/e/GenAnimPipeline/HY-Motion-1.0`).
+1. Clone the HY-Motion 1.0 [Repository](https://github.com/Tencent-Hunyuan/HY-Motion-1.0.git) to your Windows drive via WSL2 (e.g., `/mnt/e/GenAnimPipeline/HY-Motion-1.0`).
 2. Navigate into the folder: `cd /mnt/e/GenAnimPipeline/HY-Motion-1.0`.
 3. Pull the actual 3D mesh files to replace Git LFS text pointers:
    ```bash
@@ -165,6 +165,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    ```
 4. Download the checkpoint weights directly to bypass CLI linking issues:
    ```bash
+   pip install huggingface_hub
    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='tencent/HY-Motion-1.0', local_dir='ckpts/tencent/HY-Motion-1.0', local_dir_use_symlinks=False)"
    ```
 
