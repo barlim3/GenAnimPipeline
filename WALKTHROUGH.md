@@ -440,6 +440,10 @@ When sitting down to use the pipeline, follow this exact boot sequence to ensure
 ### Step 1: Ignite the Background Services (Windows/WSL)
 
 1. Ensure the **Ollama** app is running in your Windows system tray and run `ollama run llama3` in a Windows Command Prompt.
+   ```bash
+   ollama run llama3
+   ollama run llava
+   ```
 2. Open a WSL2 (Ubuntu) terminal and start your Milvus memory database:
    ```bash
    sudo docker compose up -d
