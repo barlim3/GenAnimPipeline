@@ -115,7 +115,16 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 2. Open Windows "Environment Variables" and add a new System Variable:
    * **Variable name:** `OLLAMA_HOST`
    * **Variable value:** `0.0.0.0`
-3. Quit Ollama from your system tray, reopen it, and run `ollama run llama3` in a Windows Command Prompt.
+3. Quit Ollama from your system tray, reopen it, and pull the two models the pipeline requires:
+   ```
+   ollama pull llama3
+   ollama pull llava
+   ```
+   `llama3` is the planner (Node 2) and the critic's semantic logician (Stage 2). `llava` is the critic's art director (Stage 3) -- it receives skeleton keyframe images for visual quality scoring. Pull `llava` once and Ollama serves it on demand via the same endpoint.
+
+   > **LLaVA VRAM:** LLaVA (7B) requires ~4-8 GB VRAM. Like the planner, the critic passes `"keep_alive": 0` so Ollama releases it immediately after scoring. If VRAM is tight, set `OLLAMA_NUM_GPU=0` to run LLaVA on CPU -- inference will be slower (~10-30s per evaluation) but the result is the same.
+   >
+   > **Swapping the vision model:** To use a larger or different multimodal model (e.g., `llava:13b`, `bakllava`), pull it and update `VISION_MODEL` in `graph.py`.
 
 > **Swapping the planner model:** To use a different LLM (e.g., Mistral, Gemma2, Phi3), pull it with `ollama pull <model>` and update `PLANNER_MODEL` in the configuration block at the top of `graph.py`. No other code changes are needed.
 
@@ -149,6 +158,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130 --upgrade --force-reinstall
    pip install "numpy<2.0"
    pip install transformers tokenizers accelerate bitsandbytes triton huggingface_hub langgraph langchain-community requests mcp
+   pip install bvh matplotlib
    ```
 
 ---
@@ -355,6 +365,7 @@ MOTION_SEED = 999         # Reproducibility seed for HY-Motion inference
 # -- Planner LLM (Ollama API on Windows host) --
 # Change PLANNER_MODEL to any Ollama-pulled model (e.g. "mistral", "gemma2", "phi3")
 PLANNER_MODEL = "llama3"
+VISION_MODEL = "llava"    # LLaVA vision model for critic Stage 3 art direction
 OLLAMA_PORT = 11434
 
 # -- Motion Generation Engine (HY-Motion-1.0 in WSL2) --
@@ -372,6 +383,7 @@ MILVUS_COLLECTION = "motion_corrections"
 # -- Output Paths (WSL2 mount) --
 OUTPUT_FBX_PATH = "/mnt/e/GenAnimPipeline/final_animation.fbx"
 OUTPUT_BVH_PATH = "/mnt/e/GenAnimPipeline/temp_motion.bvh"
+OUTPUT_NPZ_PATH = "/mnt/e/GenAnimPipeline/temp_motion.npz"
 
 # -- MCP Blender Fallback (Windows-native paths for the Blender server) --
 MCP_SERVER_PORT = 8000
@@ -401,8 +413,8 @@ retrieve_context -> generate_plan -> generate_motion -> evaluate_motion
 |------|---------|
 | `retrieve_context` | Connects to Milvus and loads historical motion correction embeddings. Degrades gracefully if offline. |
 | `generate_plan` | Asks the planner LLM (via Ollama on the Windows host) to decompose the prompt into a Laban-style motion plan (action_type, spatial_level, speed). Falls back to a safe default plan if the LLM is unreachable. |
-| `generate_motion` | Runs the motion diffusion transformer. Writes the prompt in the engine's expected format, invokes inference, then applies smart fallback logic: prefers native FBX, falls back to BVH, or logs an error if neither exists. |
-| `evaluate_motion` | Scores the generated motion (currently a hardcoded 0.90 placeholder). Replace with an ML-based critic or human-in-the-loop to activate the re-plan loop. |
+| `generate_motion` | Runs the motion diffusion transformer. Writes the prompt in the engine's expected format, invokes inference, then applies smart fallback logic: prefers native FBX, falls back to BVH, or logs an error if neither exists. Always copies the co-generated `.npz` file (SMPL-H pose data) to `temp_motion.npz` so the critic cascade can evaluate the motion via the `SmplhMocap` adapter. |
+| `evaluate_motion` | **4-Stage Critic Cascade.** Runs sequentially -- an earlier failure skips heavier stages: **(1) Kinematic Gatekeeper** checks for foot sliding via forward kinematics (pure Python/numpy); **(2) Semantic Logician** sends a sampled joint trajectory JSON to Llama 3 to verify semantic intent; **(3) Art Director** renders 4 skeleton keyframes with matplotlib and sends the PNG to LLaVA for visual quality scoring; **(4) Human Sign-Off** prints a CLI block and waits for `Y`/`N` input. Requires `bvh`, `matplotlib`, `numpy` (WSL2) and `llava` pulled in Ollama (Windows). |
 | `execute_mcp` | (Conditional) When only a BVH was produced, contacts the Windows FastMCP Blender server via SSE to convert it to FBX. |
 
 ### Full Source
@@ -454,6 +466,8 @@ python graph.py
 | What to swap | Config location | Variables to change |
 |---|---|---|
 | Planner LLM | `graph.py` config block | `PLANNER_MODEL`, `OLLAMA_PORT` |
+| Critic vision model (Stage 3) | `graph.py` config block | `VISION_MODEL` (e.g. `"llava:13b"`, `"bakllava"`) |
+| Critic score threshold | `graph.py` config block | `CRITIC_SCORE_THRESHOLD` (default `0.85`) |
 | Motion engine | `graph.py` config block | `MOTION_ENGINE_DIR`, `MOTION_ENGINE_CHECKPOINT`, `MOTION_ENGINE_SCRIPT` (+ prompt format in `generate_motion_node()`) |
 | Vector database | `graph.py` config block | `MILVUS_HOST`, `MILVUS_PORT`, `MILVUS_COLLECTION` |
 | Blender version | `mcp_server/translate_to_fbx.py` config block | `BLENDER_EXE` |

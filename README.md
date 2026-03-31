@@ -89,7 +89,7 @@ This symbolic plan gives the downstream motion generator structured context beyo
 | **Config variables** | `MOTION_ENGINE_DIR`, `MOTION_ENGINE_CHECKPOINT`, `MOTION_ENGINE_SCRIPT` in `graph.py` |
 
 **Role in the pipeline:**
-This is the core generative model. It takes the text prompt and duration, runs a diffusion process over learned motion distributions, and outputs skeleton-based 3D character animation data (SMPL-H format, 52 joints at 30 FPS). The output is either a native FBX file (preferred) or raw BVH skeleton data (triggers the Blender fallback).
+This is the core generative model. It takes the text prompt and duration, runs a diffusion process over learned motion distributions, and outputs skeleton-based 3D character animation data (SMPL-H format, 52 joints at 30 FPS). HY-Motion produces both an FBX file (game-engine ready) and an NPZ file (raw SMPL-H pose parameters: axis-angle rotations for 52 joints + root translation per frame). The pipeline copies both: FBX to `final_animation.fbx` (primary output) and NPZ to `temp_motion.npz` (used by the critic cascade via the `SmplhMocap` adapter for kinematic and visual evaluation). If only BVH is produced (e.g., from a different motion engine), it is copied to `temp_motion.bvh` and the Blender fallback is triggered.
 
 **Sub-models bundled inside HY-Motion:**
 
@@ -159,37 +159,51 @@ The Milvus vector database stores historical motion correction rules as 384-dime
 
 ---
 
-### 4. Critic Model -- Quality Evaluation
+### 4. Critic -- 4-Stage Evaluation Cascade
 
 | | |
 |---|---|
-| **Current model** | None (hardcoded placeholder returning 0.90) |
-| **Type** | TBD -- ML classifier, reward model, or human-in-the-loop |
+| **Current model** | Llama 3 (semantic) + LLaVA (visual) + Human-in-the-Loop |
+| **Type** | Multi-stage validation funnel (physics → LLM → vision → human) |
 | **Pipeline stage** | Node 4: `evaluate_motion` |
-| **Runs on** | TBD |
-| **Config variables** | `CRITIC_SCORE_THRESHOLD`, `MAX_ITERATIONS` in `graph.py` |
+| **Runs on** | WSL2 (Stages 1, 2, 3 compute) + terminal blocking prompt (Stage 4) |
+| **Config variables** | `CRITIC_SCORE_THRESHOLD`, `MAX_ITERATIONS`, `VISION_MODEL` in `graph.py` |
 
 **Role in the pipeline:**
-The critic evaluates generated motion quality on a 0.0-1.0 scale. The `route_evaluation` function uses this score to decide the next step:
+The critic evaluates generated motion quality on a 0.0-1.0 scale through four sequential stages. If any stage fails, it immediately returns its score and skips all heavier downstream stages. The `route_evaluation` function uses the final score:
 - Score >= `CRITIC_SCORE_THRESHOLD` (0.85): Accept the animation and proceed to output.
 - Score < threshold and iterations < `MAX_ITERATIONS` (3): Loop back to `generate_plan` for another attempt.
 - Iterations >= `MAX_ITERATIONS`: Accept regardless and proceed.
 
-Currently this always returns 0.90, so every generation passes on the first attempt.
+**The 4 stages:**
 
-**How to implement:**
-Replace the body of `evaluate_motion_node()` in `graph.py` with actual evaluation logic. Options include:
-- **ML-based reward model:** Train or use a pre-trained motion quality classifier that scores the generated FBX/BVH.
-- **CLIP-based alignment:** Compare the text prompt embedding against the motion embedding to measure semantic alignment.
-- **Human-in-the-loop:** Pause the pipeline, preview the animation, and provide a manual score.
+| Stage | What it checks | Fail score | Failure condition |
+|---|---|---|---|
+| **1 - Kinematic Gatekeeper** | Forward-kinematics foot-sliding check. Detects when a grounded foot (Y near 0) drifts in XZ between frames. Thresholds are relative to character height. | 0.1 | > 15% of grounded frames exceed the XZ drift threshold |
+| **2 - Semantic Logician** | Samples the BVH every 10 frames, extracts Spine/Arm positions and rotations into a lightweight JSON, and sends it to Llama 3 with the original prompt. Asks the LLM whether the trajectory matches the semantic intent. | 0.4 | LLM determines `matches: false` |
+| **3 - Art Director** | Renders a 2×2 grid of 4 skeleton keyframes using matplotlib 3D and sends the PNG image to LLaVA. Prompts the vision model to score weight, fluidity, and pose dynamics out of 1.0. | LLaVA's score (< 0.85) | LLaVA scores below `CRITIC_SCORE_THRESHOLD` |
+| **4 - Human Sign-Off** | Prints the prompt, AI score, feedback, and file path to the terminal in a visible block. Waits for `Y` or `N` via `input()`. If rejected, prompts for a reason. | 0.0 + custom reason | User presses N |
 
+Stages 2 and 3 fail gracefully if Ollama is asleep or times out -- they pass with a reduced confidence score (0.7) rather than blocking the pipeline.
+
+**Requirements:**
+- `pip install bvh matplotlib numpy` (WSL2 environment -- see Phase 4)
+- LLaVA model pulled in Ollama: `ollama pull llava`
+- LLaVA requires ~4-8 GB VRAM (runs on Windows host via the same Ollama endpoint as the planner)
+
+**Data source:**
+The critic accepts two input formats, tried in this order:
+1. **BVH file** (parsed directly with the `bvh` library) -- used if the motion engine produces a `.bvh` file.
+2. **SMPL-H NPZ file** (parsed via the `SmplhMocap` adapter in `graph.py`) -- used when HY-Motion outputs FBX+NPZ without a BVH. The adapter converts axis-angle rotations to ZXY Euler angles and exposes the same API as the `bvh` library, so all four stages work identically on both formats. Spatial values are scaled from metres to centimetres to match the kinematic thresholds.
+
+**How to swap the vision model:**
+Change `VISION_MODEL` in `graph.py`:
 ```python
-def evaluate_motion_node(state: PipelineState):
-    # Example: plug in a real critic model
-    score = my_critic_model.evaluate(state["final_asset_path"], state["prompt"])
-    feedback = my_critic_model.get_feedback()
-    return {"critic_score": score, "critic_feedback": feedback}
+VISION_MODEL = "llava:13b"  # or "bakllava", "llava:34b", etc.
 ```
+
+**How to swap the semantic model:**
+The semantic logician reuses `PLANNER_MODEL` and `OLLAMA_PORT`, so swapping the planner automatically upgrades Stage 2 as well.
 
 ---
 
@@ -225,6 +239,7 @@ All model settings are centralized in configuration blocks. Here is a quick refe
 ```python
 # -- Planner LLM --
 PLANNER_MODEL = "llama3"    # Any Ollama-pulled model name
+VISION_MODEL = "llava"      # LLaVA vision model for Stage 3 art direction
 OLLAMA_PORT = 11434         # Ollama API port
 
 # -- Motion Engine --
@@ -254,11 +269,12 @@ SERVER_PORT = 8000
 
 | What to swap | Config file | Variables | Notes |
 |---|---|---|---|
-| Planner LLM | `graph.py` | `PLANNER_MODEL`, `OLLAMA_PORT` | `ollama pull <model>` first |
+| Planner LLM | `graph.py` | `PLANNER_MODEL`, `OLLAMA_PORT` | `ollama pull <model>` first; also upgrades Stage 2 critic |
+| Vision model (critic Stage 3) | `graph.py` | `VISION_MODEL` | `ollama pull llava:13b` etc.; any multimodal Ollama model |
 | Motion engine | `graph.py` | `MOTION_ENGINE_DIR`, `_CHECKPOINT`, `_SCRIPT` | Adapt prompt format in `generate_motion_node()` |
 | Motion engine variant | `graph.py` | `MOTION_ENGINE_CHECKPOINT` | e.g., `ckpts/tencent/HY-Motion-1.0-Lite` for lighter model |
 | Embedding model | `init_milvus.py` | `dim=384` field schema | Recreate Milvus collection if dimension changes |
-| Critic model | `graph.py` | `evaluate_motion_node()` body | Replace placeholder with real scoring logic |
+| Critic thresholds | `graph.py` | `CRITIC_SCORE_THRESHOLD`, `MAX_ITERATIONS` | Raise threshold for stricter gating; lower for faster iteration |
 | Blender version | `translate_to_fbx.py` | `BLENDER_EXE` | Check API compatibility for BVH/FBX ops |
 | MCP server port | Both files | `MCP_SERVER_PORT` / `SERVER_PORT` | Must match between `graph.py` and `translate_to_fbx.py` |
 
