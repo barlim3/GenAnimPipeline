@@ -105,7 +105,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    else:
        print("Collection already exists!")
    ```
-4. Run `pip install pymilvus` followed by `python init_milvus.py`.
+4. Run `pip install langchain langgraph pymilvus` followed by `python init_milvus.py`.
 
 ---
 
