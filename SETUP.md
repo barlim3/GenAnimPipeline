@@ -175,6 +175,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    ```
 4. Download the checkpoint weights directly to bypass CLI linking issues:
    ```bash
+   pip install -r HY-Motion-1.0/requirements.txt
    pip install huggingface_hub
    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='tencent/HY-Motion-1.0', local_dir='ckpts/tencent/HY-Motion-1.0', local_dir_use_symlinks=False)"
    pip install -U "huggingface_hub[cli]"
@@ -205,7 +206,7 @@ To prevent VRAM explosion, we must bypass HY-Motion's internal 40GB LLM and set 
            # self._init_prompter()
            # self._load_model()
    ```
-3. **Overwrite the `__call__` function** to intercept the text and parse the duration dial from the `HY_MOTION_DURATION` environment variable (set by `graph.py`'s config block). Replace the entire function with:
+3. **Overwrite the `rewrite_prompt_and_infer_time` function** to intercept the text and parse the duration dial from the `HY_MOTION_DURATION` environment variable (set by `graph.py`'s config block). Replace the entire function with:
    ```python
        def __call__(self, text, *args, **kwargs):
            import os
