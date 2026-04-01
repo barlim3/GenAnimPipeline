@@ -29,6 +29,8 @@ import json
 import requests
 import glob
 import shutil
+import logging
+from logging.handlers import RotatingFileHandler
 from typing import Dict, TypedDict, Any
 from langgraph.graph import StateGraph, END
 from pymilvus import connections, Collection
@@ -51,6 +53,22 @@ from bvh import Bvh
 # these values by name, keeping the pipeline flow untouched.
 # ============================================================================
 
+# -- Project Root --
+# All paths below are derived from this anchor so the pipeline works
+# regardless of where the repo is cloned.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _wsl_to_win(wsl_path):
+    """Convert a WSL2 /mnt/X/... path to its Windows equivalent X:\\..."""
+    if wsl_path.startswith("/mnt/") and len(wsl_path) > 6:
+        drive = wsl_path[5].upper()
+        rest = wsl_path[6:].replace("/", "\\")
+        return f"{drive}:{rest}"
+    return wsl_path.replace("/", "\\")
+
+# -- Default prompt used when running the pipeline directly --
+DEFAULT_PROMPT = "A character performs a heavy broadsword swing."
+
 # -- Animation Parameters --
 GLOBAL_DURATION = 5       # Animation length in seconds
 MOTION_SEED = 999         # Reproducibility seed for HY-Motion inference
@@ -64,7 +82,7 @@ OLLAMA_PORT = 11434
 # -- Motion Generation Engine (HY-Motion-1.0 in WSL2) --
 # To swap engines, update these paths and adjust the prompt format in
 # generate_motion_node() to match the new engine's expected input.
-MOTION_ENGINE_DIR = "/mnt/e/GenAnimPipeline/HY-Motion-1.0"
+MOTION_ENGINE_DIR = os.path.join(SCRIPT_DIR, "HY-Motion-1.0")
 MOTION_ENGINE_CHECKPOINT = "ckpts/tencent/HY-Motion-1.0"
 MOTION_ENGINE_SCRIPT = "local_infer.py"
 
@@ -73,19 +91,23 @@ MILVUS_HOST = "localhost"
 MILVUS_PORT = "19530"
 MILVUS_COLLECTION = "motion_corrections"
 
-# -- Output Paths (WSL2 mount) --
-OUTPUT_FBX_PATH = "/mnt/e/GenAnimPipeline/final_animation.fbx"
-OUTPUT_BVH_PATH = "/mnt/e/GenAnimPipeline/temp_motion.bvh"
-OUTPUT_NPZ_PATH = "/mnt/e/GenAnimPipeline/temp_motion.npz"
+# -- Output Paths (relative to project root) --
+OUTPUT_FBX_PATH = os.path.join(SCRIPT_DIR, "final_animation.fbx")
+OUTPUT_BVH_PATH = os.path.join(SCRIPT_DIR, "temp_motion.bvh")
+OUTPUT_NPZ_PATH = os.path.join(SCRIPT_DIR, "temp_motion.npz")
 
-# -- MCP Blender Fallback (Windows-native paths for the Blender server) --
+# -- MCP Blender Fallback (Windows-native paths derived from output paths above) --
 MCP_SERVER_PORT = 8000
-WIN_BVH_PATH = "E:\\GenAnimPipeline\\temp_motion.bvh"
-WIN_FBX_PATH = "E:\\GenAnimPipeline\\final_animation.fbx"
+WIN_BVH_PATH = _wsl_to_win(OUTPUT_BVH_PATH)
+WIN_FBX_PATH = _wsl_to_win(OUTPUT_FBX_PATH)
 
 # -- Critic / Evaluation Thresholds --
 CRITIC_SCORE_THRESHOLD = 0.85  # Minimum score to accept without re-planning
 MAX_ITERATIONS = 3             # Hard cap on plan-generate-evaluate loops
+
+# -- Logging --
+LOG_LEVEL = logging.DEBUG                               # Set to logging.INFO to reduce verbosity
+LOG_FILE  = os.path.join(SCRIPT_DIR, "pipeline.log")  # Rotating log file (5 MB × 3 backups)
 
 # Pass duration to HY-Motion's patched prompt_rewrite.py via environment
 os.environ["HY_MOTION_DURATION"] = str(GLOBAL_DURATION)
@@ -97,6 +119,48 @@ def _get_windows_host_ip():
     return subprocess.check_output(
         "ip route list default | awk '{print $3}'", shell=True
     ).decode().strip()
+
+# ============================================================================
+# LOGGER SETUP
+# Writes structured debug output to both the console and a rotating log file.
+# Adjust LOG_LEVEL in the config block above to control verbosity.
+# ============================================================================
+
+_LOG_FMT      = "[%(asctime)s] [%(levelname)-8s] %(message)s"
+_LOG_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+logger = logging.getLogger("pipeline")
+logger.setLevel(LOG_LEVEL)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(_LOG_FMT, _LOG_DATE_FMT))
+
+_file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(logging.Formatter(_LOG_FMT, _LOG_DATE_FMT))
+
+logger.addHandler(_console_handler)
+logger.addHandler(_file_handler)
+
+
+def _fmt_val(v) -> str:
+    """Truncate long values so I/O dumps stay readable in the log."""
+    s = repr(v)
+    return s if len(s) <= 200 else s[:197] + "..."
+
+
+def _log_input(node: str, keys: list, state: dict) -> None:
+    logger.debug("[%s] ── INPUT  ─────────────────────────────────────", node)
+    for k in keys:
+        logger.debug("[%s]   %-22s = %s", node, k, _fmt_val(state.get(k)))
+
+
+def _log_output(node: str, result: dict) -> None:
+    logger.debug("[%s] ── OUTPUT ─────────────────────────────────────", node)
+    for k, v in result.items():
+        logger.debug("[%s]   %-22s = %s", node, k, _fmt_val(v))
+
 
 # Shared state dictionary passed between every node in the LangGraph workflow.
 # Each node reads what it needs and returns a partial dict to merge back in.
@@ -114,27 +178,33 @@ def retrieve_context_node(state: PipelineState):
     """Node 1: Connect to the Milvus vector database and load historical motion
     correction rules. These embeddings let the planner avoid known failure modes.
     Gracefully degrades if Milvus is offline -- the pipeline continues without context."""
-    print("Agent: Connecting to Vector Memory...")
+    _log_input("retrieve_context", ["prompt"], state)
+    logger.info("[retrieve_context] Connecting to Milvus at %s:%s ...", MILVUS_HOST, MILVUS_PORT)
     historical_context = []
     try:
         connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
         collection = Collection(MILVUS_COLLECTION)
         collection.load()
-        print("Milvus connected successfully.")
+        logger.info("[retrieve_context] Milvus connected. Collection '%s' loaded.", MILVUS_COLLECTION)
     except Exception as e:
-        print(f"Vector DB not available: {e}")
-    return {"historical_context": historical_context}
+        logger.warning("[retrieve_context] Vector DB not available — continuing without context. Error: %s", e)
+    result = {"historical_context": historical_context}
+    _log_output("retrieve_context", result)
+    return result
 
 def generate_symbolic_plan_node(state: PipelineState):
     """Node 2: Ask Ollama/Llama-3 (running on the Windows host) to decompose the
     user prompt into a structured Laban-style motion plan. The Windows host IP is
     discovered dynamically via the WSL2 default gateway. Falls back to a safe
     default plan if the LLM is unreachable."""
-    print(f"Agent: Generating symbolic motion plan with {PLANNER_MODEL}...")
+    _log_input("generate_plan", ["prompt", "historical_context", "iteration_count", "critic_feedback"], state)
+    logger.info("[generate_plan] Generating symbolic motion plan with %s (iteration %s)...",
+                PLANNER_MODEL, state.get("iteration_count", 0))
     prompt = state["prompt"]
 
     try:
         win_ip = _get_windows_host_ip()
+        logger.debug("[generate_plan] Resolved Windows host IP: %s", win_ip)
         system_prompt = "Output a JSON object for motion planning. Keys: 'action_type', 'spatial_level', 'speed'."
         response = requests.post(
             f"http://{win_ip}:{OLLAMA_PORT}/api/generate",
@@ -142,12 +212,14 @@ def generate_symbolic_plan_node(state: PipelineState):
             timeout=30
         )
         plan = json.loads(response.json().get("response", "{}"))
-        print(f"{PLANNER_MODEL} Plan Generated: {plan}")
+        logger.info("[generate_plan] Plan received: %s", plan)
     except Exception as e:
-        print(f"LLM Fallback. Error: {e}")
+        logger.warning("[generate_plan] LLM unreachable — using fallback plan. Error: %s", e)
         plan = {"action_type": "idle", "spatial_level": "mid", "speed": "normal"}
 
-    return {"laban_plan": plan, "iteration_count": state.get("iteration_count", 0) + 1}
+    result = {"laban_plan": plan, "iteration_count": state.get("iteration_count", 0) + 1}
+    _log_output("generate_plan", result)
+    return result
 
 def generate_motion_node(state: PipelineState):
     """Node 3: Run the HY-Motion-1.0 diffusion transformer to generate animation data.
@@ -160,11 +232,14 @@ def generate_motion_node(state: PipelineState):
       - If only a .bvh was produced, copy it to temp_motion.bvh (triggers Blender fallback).
       - If neither exists, log a critical error and continue with an empty asset path.
     """
-    print("Agent: Initiating deep neural network motion generation...")
+    _log_input("generate_motion", ["prompt", "laban_plan", "iteration_count"], state)
+    logger.info("[generate_motion] Starting HY-Motion-1.0 inference (duration=%ss, seed=%s)...",
+                GLOBAL_DURATION, MOTION_SEED)
     prompt = state["prompt"]
 
     # Clear previous inference outputs to avoid stale file collisions
     os.system(f"rm -rf {MOTION_ENGINE_DIR}/output/local_infer/*")
+    logger.debug("[generate_motion] Cleared previous inference outputs.")
 
     # Write the prompt file in HY-Motion's input format: "text#duration#seed"
     input_text_dir = os.path.join(MOTION_ENGINE_DIR, "prompt_inputs")
@@ -172,13 +247,16 @@ def generate_motion_node(state: PipelineState):
     prompt_file_path = os.path.join(input_text_dir, "task.txt")
     with open(prompt_file_path, "w") as f:
         f.write(f"{prompt}#{GLOBAL_DURATION}#{MOTION_SEED}\n")
+    logger.debug("[generate_motion] Wrote prompt file: %s", prompt_file_path)
 
     command = ["python", MOTION_ENGINE_SCRIPT, "--model_path", MOTION_ENGINE_CHECKPOINT, "--input_text_dir", "prompt_inputs"]
+    logger.debug("[generate_motion] Command: %s (cwd=%s)", " ".join(command), MOTION_ENGINE_DIR)
 
     asset_path = ""
 
     try:
         subprocess.run(command, cwd=MOTION_ENGINE_DIR, check=True)
+        logger.info("[generate_motion] Inference complete. Scanning output directory...")
 
         # --- SMART FALLBACK LOGIC ---
         # Prefer native FBX (game-engine ready); fall back to BVH (raw skeleton data).
@@ -189,30 +267,34 @@ def generate_motion_node(state: PipelineState):
         fbx_files = glob.glob(f"{output_dir}/**/*.fbx", recursive=True)
         bvh_files = glob.glob(f"{output_dir}/**/*.bvh", recursive=True)
         npz_files = glob.glob(f"{output_dir}/**/*.npz", recursive=True)
+        logger.debug("[generate_motion] Found — FBX: %s | BVH: %s | NPZ: %s",
+                     fbx_files, bvh_files, npz_files)
 
         if fbx_files:
-            print("Agent: Native FBX detected. Bypassing translation.")
+            logger.info("[generate_motion] Native FBX detected. Copying to %s.", OUTPUT_FBX_PATH)
             shutil.copy(fbx_files[0], OUTPUT_FBX_PATH)
             asset_path = OUTPUT_FBX_PATH
             # Preserve BVH if it exists (unlikely for HY-Motion, but handled).
             if bvh_files:
                 shutil.copy(bvh_files[0], OUTPUT_BVH_PATH)
-                print("Agent: Co-generated BVH preserved for critic evaluation.")
+                logger.debug("[generate_motion] Co-generated BVH copied to %s.", OUTPUT_BVH_PATH)
             # Always preserve the NPZ (SMPL-H pose data) for the critic cascade.
             if npz_files:
                 shutil.copy(npz_files[0], OUTPUT_NPZ_PATH)
-                print("Agent: SMPL-H motion data (.npz) preserved for critic evaluation.")
+                logger.debug("[generate_motion] SMPL-H NPZ copied to %s.", OUTPUT_NPZ_PATH)
         elif bvh_files:
-            print("Agent: No FBX found. Falling back to raw BVH format.")
+            logger.info("[generate_motion] No FBX found — falling back to BVH. Copying to %s.", OUTPUT_BVH_PATH)
             shutil.copy(bvh_files[0], OUTPUT_BVH_PATH)
             asset_path = OUTPUT_BVH_PATH
         else:
-            print("Agent: CRITICAL ERROR - No animation files were generated.")
+            logger.error("[generate_motion] CRITICAL — no animation files were produced by the engine.")
 
     except subprocess.CalledProcessError as e:
-        print(f"Motion generation failed: {e}")
+        logger.error("[generate_motion] HY-Motion subprocess failed: %s", e)
 
-    return {"final_asset_path": asset_path}
+    result = {"final_asset_path": asset_path}
+    _log_output("generate_motion", result)
+    return result
 
 # ============================================================================
 # SMPL-H NPZ ADAPTER
@@ -773,6 +855,7 @@ def evaluate_motion_node(state: PipelineState):
       Stage 3 - Art Director         : LLaVA vision model scores skeleton keyframes
       Stage 4 - Human Sign-Off      : CLI approval gate (only if AI score >= 0.85)
     """
+    _log_input("evaluate_motion", ["final_asset_path", "prompt", "iteration_count"], state)
     asset_path = state.get("final_asset_path", "")
     prompt = state.get("prompt", "")
 
@@ -795,54 +878,69 @@ def evaluate_motion_node(state: PipelineState):
         try:
             with open(bvh_path, 'r') as f:
                 mocap = Bvh(f.read())
-            print(f"Critic: Loaded BVH with {mocap.nframes} frames from {bvh_path}")
+            logger.info("[evaluate_motion] Loaded BVH — %d frames from %s", mocap.nframes, bvh_path)
         except Exception as e:
-            print(f"Critic: BVH parse failed ({e}), trying NPZ fallback...")
+            logger.warning("[evaluate_motion] BVH parse failed (%s) — trying NPZ fallback...", e)
 
     # NPZ fallback -- HY-Motion always generates .npz with SMPL-H pose data
     if mocap is None:
         npz_path = OUTPUT_NPZ_PATH
         if not os.path.exists(npz_path):
-            print("Critic: No BVH or NPZ found for evaluation. Passing with default score.")
-            return {"critic_score": 0.85, "critic_feedback": "No motion data available for evaluation."}
+            logger.warning("[evaluate_motion] No BVH or NPZ found — passing with default score.")
+            result = {"critic_score": 0.85, "critic_feedback": "No motion data available for evaluation."}
+            _log_output("evaluate_motion", result)
+            return result
         try:
             mocap = SmplhMocap(npz_path)
-            print(f"Critic: Loaded SMPL-H NPZ with {mocap.nframes} frames from {npz_path}")
+            logger.info("[evaluate_motion] Loaded SMPL-H NPZ — %d frames from %s", mocap.nframes, npz_path)
         except Exception as e:
-            print(f"Critic: NPZ parse error: {e}")
-            return {"critic_score": 0.5, "critic_feedback": f"Motion data parse error: {e}"}
+            logger.error("[evaluate_motion] NPZ parse error: %s", e)
+            result = {"critic_score": 0.5, "critic_feedback": f"Motion data parse error: {e}"}
+            _log_output("evaluate_motion", result)
+            return result
 
     if mocap.nframes < 2:
-        print("Critic: Motion has fewer than 2 frames -- insufficient for evaluation.")
-        return {"critic_score": 0.3, "critic_feedback": "Motion contains insufficient frames for evaluation."}
+        logger.warning("[evaluate_motion] Only %d frame(s) — insufficient for evaluation.", mocap.nframes)
+        result = {"critic_score": 0.3, "critic_feedback": "Motion contains insufficient frames for evaluation."}
+        _log_output("evaluate_motion", result)
+        return result
 
     # ---- STAGE 1: Kinematic Gatekeeper (Python math) ----
-    print("\n--- Stage 1/4: Kinematic Gatekeeper ---")
+    logger.info("[evaluate_motion] ── Stage 1/4: Kinematic Gatekeeper ──────────────────")
     passed, score, feedback = _stage1_kinematic_gatekeeper(mocap)
-    print(f"  {'PASS' if passed else 'FAIL'} | {feedback}")
+    logger.info("[evaluate_motion]   %s | score=%.2f | %s", "PASS" if passed else "FAIL", score, feedback)
     if not passed:
-        return {"critic_score": score, "critic_feedback": feedback}
+        result = {"critic_score": score, "critic_feedback": feedback}
+        _log_output("evaluate_motion", result)
+        return result
 
     # ---- STAGE 2: Semantic Logician (Llama 3) ----
-    print("\n--- Stage 2/4: Semantic Logician (Llama 3) ---")
+    logger.info("[evaluate_motion] ── Stage 2/4: Semantic Logician (Llama 3) ──────────")
     passed, score, feedback = _stage2_semantic_logician(mocap, prompt)
-    print(f"  {'PASS' if passed else 'FAIL'} | {feedback}")
+    logger.info("[evaluate_motion]   %s | score=%.2f | %s", "PASS" if passed else "FAIL", score, feedback)
     if not passed:
-        return {"critic_score": score, "critic_feedback": feedback}
+        result = {"critic_score": score, "critic_feedback": feedback}
+        _log_output("evaluate_motion", result)
+        return result
 
     # ---- STAGE 3: Art Director (LLaVA) ----
-    print("\n--- Stage 3/4: Art Director (LLaVA) ---")
+    logger.info("[evaluate_motion] ── Stage 3/4: Art Director (LLaVA) ─────────────────")
     passed, score, feedback = _stage3_art_director(mocap, prompt)
-    print(f"  {'PASS' if passed else 'FAIL'} | Score: {score:.2f} | {feedback}")
+    logger.info("[evaluate_motion]   %s | score=%.2f | %s", "PASS" if passed else "FAIL", score, feedback)
     if not passed:
-        return {"critic_score": score, "critic_feedback": feedback}
+        result = {"critic_score": score, "critic_feedback": feedback}
+        _log_output("evaluate_motion", result)
+        return result
 
     # ---- STAGE 4: Human-in-the-Loop (CLI) ----
-    print("\n--- Stage 4/4: Human-in-the-Loop ---")
+    logger.info("[evaluate_motion] ── Stage 4/4: Human-in-the-Loop ──────────────────── ")
     final_score, final_feedback = _stage4_human_sign_off(prompt, score, feedback, asset_path)
-    print(f"  {'APPROVED' if final_score == 1.0 else 'REJECTED'} | {final_feedback}")
+    logger.info("[evaluate_motion]   %s | %s",
+                "APPROVED" if final_score == 1.0 else "REJECTED", final_feedback)
 
-    return {"critic_score": final_score, "critic_feedback": final_feedback}
+    result = {"critic_score": final_score, "critic_feedback": final_feedback}
+    _log_output("evaluate_motion", result)
+    return result
 
 def execute_mcp_translation_node(state: PipelineState):
     """Node 5 (conditional): BVH-to-FBX fallback via the Windows Blender MCP server.
@@ -855,11 +953,15 @@ def execute_mcp_translation_node(state: PipelineState):
 
     Paths are Windows-native because Blender runs on the Windows side.
     """
-    print("Agent: BVH Detected. Contacting Windows MCP Server via SSE to boot Blender...")
+    _log_input("execute_mcp", ["final_asset_path", "critic_score", "critic_feedback"], state)
+    logger.info("[execute_mcp] BVH detected — contacting Windows Blender MCP server...")
+    logger.debug("[execute_mcp] BVH input (Windows): %s", WIN_BVH_PATH)
+    logger.debug("[execute_mcp] FBX output (Windows): %s", WIN_FBX_PATH)
 
     try:
         win_ip = _get_windows_host_ip()
         mcp_url = f"http://{win_ip}:{MCP_SERVER_PORT}/sse"
+        logger.debug("[execute_mcp] MCP SSE endpoint: %s", mcp_url)
 
         async def run_mcp_tool():
             async with sse_client(mcp_url) as (read_stream, write_stream):
@@ -870,16 +972,18 @@ def execute_mcp_translation_node(state: PipelineState):
                         arguments={"bvh_motion_path": WIN_BVH_PATH, "output_fbx_path": WIN_FBX_PATH}
                     )
 
-        result = asyncio.run(run_mcp_tool())
-        print(f"Blender Server Output: {result.content}")
+        mcp_result = asyncio.run(run_mcp_tool())
+        logger.info("[execute_mcp] Blender server response: %s", mcp_result.content)
 
     except ExceptionGroup as eg:
         for exc in eg.exceptions:
-            print(f"Connection Error: {exc}")
+            logger.error("[execute_mcp] Connection error: %s", exc)
     except Exception as e:
-        print(f"Failed to execute MCP tool: {e}")
+        logger.error("[execute_mcp] MCP tool call failed: %s", e)
 
-    return {"final_asset_path": WIN_FBX_PATH}
+    result = {"final_asset_path": WIN_FBX_PATH}
+    _log_output("execute_mcp", result)
+    return result
 
 def route_evaluation(state: PipelineState):
     """Conditional router after the critic node. Three possible outcomes:
@@ -887,12 +991,20 @@ def route_evaluation(state: PipelineState):
       - "execute_mcp" : Score passed but only BVH exists -- trigger Blender fallback.
       - "replan"      : Score too low and iterations remain -- loop back to the planner.
     Caps at MAX_ITERATIONS to prevent infinite loops on stubborn prompts."""
-    if state["critic_score"] >= CRITIC_SCORE_THRESHOLD or state["iteration_count"] >= MAX_ITERATIONS:
-        if state.get("final_asset_path", "").endswith(".bvh"):
-            return "execute_mcp"
-        else:
-            return "finish"
-    return "replan"
+    score     = state["critic_score"]
+    iteration = state["iteration_count"]
+    asset     = state.get("final_asset_path", "")
+    logger.debug("[route_evaluation] critic_score=%.2f | iteration=%d/%d | asset=%s",
+                 score, iteration, MAX_ITERATIONS, asset)
+
+    if score >= CRITIC_SCORE_THRESHOLD or iteration >= MAX_ITERATIONS:
+        route = "execute_mcp" if asset.endswith(".bvh") else "finish"
+    else:
+        route = "replan"
+
+    logger.info("[route_evaluation] Decision: %s (score=%.2f, threshold=%.2f, iteration=%d/%d)",
+                route.upper(), score, CRITIC_SCORE_THRESHOLD, iteration, MAX_ITERATIONS)
+    return route
 
 # ============================================================================
 # LANGGRAPH ASSEMBLY
@@ -932,6 +1044,12 @@ workflow.add_edge("execute_mcp", END)
 app = workflow.compile()
 
 if __name__ == "__main__":
-    print("--- STARTING GENERATIVE PIPELINE ---")
-    app.invoke({"prompt": "A character performs a heavy broadsword swing.", "iteration_count": 0})
-    print("--- PIPELINE COMPLETE ---")
+    logger.info("══════════════════════════════════════════════════════")
+    logger.info("  GENERATIVE ANIMATION PIPELINE — STARTING")
+    logger.info("  Prompt    : %s", DEFAULT_PROMPT)
+    logger.info("  Log file  : %s", LOG_FILE)
+    logger.info("══════════════════════════════════════════════════════")
+    app.invoke({"prompt": DEFAULT_PROMPT, "iteration_count": 0})
+    logger.info("══════════════════════════════════════════════════════")
+    logger.info("  PIPELINE COMPLETE")
+    logger.info("══════════════════════════════════════════════════════")
