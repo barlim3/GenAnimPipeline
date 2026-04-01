@@ -34,6 +34,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, TypedDict, Any
 from langgraph.graph import StateGraph, END
 from pymilvus import connections, Collection
+from sentence_transformers import SentenceTransformer
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 import math
@@ -75,8 +76,8 @@ MOTION_SEED = 999         # Reproducibility seed for HY-Motion inference
 
 # -- Planner LLM (Ollama API on Windows host) --
 # Change PLANNER_MODEL to any Ollama-pulled model (e.g. "mistral", "gemma2", "phi3")
-PLANNER_MODEL = "llama3"
-VISION_MODEL = "llava"        # LLaVA vision model for Stage 3 art direction
+PLANNER_MODEL = "llama3:latest"
+VISION_MODEL = "llava:latest"        # LLaVA vision model for Stage 3 art direction
 OLLAMA_PORT = 11434
 
 # -- Motion Generation Engine (HY-Motion-1.0 in WSL2) --
@@ -834,12 +835,12 @@ def _stage4_human_sign_off(prompt, ai_score, ai_feedback, asset_path):
     print(border)
 
     approval = input("  >>> Approve this motion? (Y/N): ").strip().upper()
-    if approval == 'Y':
-        return 1.0, "Human approved."
-
-    reason = input("  >>> Reason for rejection: ").strip()
-    return 0.0, f"Human Override: {reason if reason else 'No reason given.'}"
-
+    if approval == 'N':
+        reason = input("  >>> Reason for rejection: ").strip()
+        return 0.0, f"Human Override: {reason if reason else 'No reason given.'}"
+    
+    return 1.0, "Human approved."
+    
 
 # ============================================================================
 # CRITIC CASCADE - MAIN NODE
@@ -1006,23 +1007,65 @@ def route_evaluation(state: PipelineState):
                 route.upper(), score, CRITIC_SCORE_THRESHOLD, iteration, MAX_ITERATIONS)
     return route
 
+def update_memory_node(state: PipelineState):
+    """Node 3.5 (conditional): Vectorize critic rejection feedback and persist it to Milvus.
+
+    Intercepts the replan route to record what went wrong before the planner retries.
+    Only activates on genuine rejections -- human approvals and no-data passes are
+    ignored so the collection only accumulates actionable correction rules.
+
+    Embedding model : all-MiniLM-L6-v2  (384-dim, ~80 MB, CPU-friendly)
+    Collection      : motion_corrections (pre-created by init_milvus.py)
+    Insert format   : [[embedding_list], [feedback_text]]  (Milvus column-per-field)
+    """
+    _log_input("update_memory", ["critic_feedback", "critic_score", "iteration_count"], state)
+    feedback = state.get("critic_feedback", "")
+
+    if not feedback or "approved" in feedback.lower():
+        logger.info("[update_memory] No rejection feedback to store — skipping memory update.")
+        _log_output("update_memory", {})
+        return state
+
+    logger.info("[update_memory] Rejection detected — vectorizing feedback for long-term memory...")
+    logger.debug("[update_memory] Feedback: %s", feedback)
+
+    try:
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        embedding = model.encode(feedback).tolist()
+        logger.debug("[update_memory] Embedding generated (%d dims).", len(embedding))
+
+        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+        collection = Collection(MILVUS_COLLECTION)
+        collection.load()
+        collection.insert([[embedding], [feedback]])
+        collection.flush()
+        logger.info("[update_memory] Correction rule saved to Milvus collection '%s'.", MILVUS_COLLECTION)
+
+    except Exception as e:
+        logger.warning("[update_memory] Could not write to Milvus — pipeline will continue. Error: %s", e)
+
+    _log_output("update_memory", {"stored_feedback": feedback})
+    return state
+
+
 # ============================================================================
 # LANGGRAPH ASSEMBLY
 # Wires the nodes into a directed graph with one conditional branch:
 #
 #   retrieve_context -> generate_plan -> generate_motion -> evaluate_motion
 #                            ^                                   |
-#                            |  (replan)                         v
-#                            +------- route_evaluation ----> [finish | execute_mcp]
-#                                                                        |
-#                                                                        v
-#                                                                       END
+#                            |                                   v
+#                      update_memory <------ route_evaluation ---+---> [finish | execute_mcp]
+#                            |                                               |
+#                            v                                               v
+#                       generate_plan                                       END
 # ============================================================================
 workflow = StateGraph(PipelineState)
 workflow.add_node("retrieve_context", retrieve_context_node)
 workflow.add_node("generate_plan", generate_symbolic_plan_node)
 workflow.add_node("generate_motion", generate_motion_node)
 workflow.add_node("evaluate_motion", evaluate_motion_node)
+workflow.add_node("update_memory", update_memory_node)
 workflow.add_node("execute_mcp", execute_mcp_translation_node)
 
 workflow.set_entry_point("retrieve_context")
@@ -1036,9 +1079,10 @@ workflow.add_conditional_edges(
     {
         "execute_mcp": "execute_mcp",
         "finish": END,
-        "replan": "generate_plan"
+        "replan": "update_memory"
     }
 )
+workflow.add_edge("update_memory", "generate_plan")
 workflow.add_edge("execute_mcp", END)
 
 app = workflow.compile()

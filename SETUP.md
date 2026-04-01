@@ -158,7 +158,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130 --upgrade --force-reinstall
    pip install "numpy<2.0"
    pip install transformers tokenizers accelerate bitsandbytes triton huggingface_hub langgraph langchain-community requests mcp
-   pip install bvh matplotlib
+   pip install bvh matplotlib sentence-transformers
    ```
 
 ---
@@ -420,11 +420,11 @@ The LangGraph workflow connects five nodes in a directed graph with one conditio
 ```
 retrieve_context -> generate_plan -> generate_motion -> evaluate_motion
                          ^                                   |
-                         |  (replan)                         v
-                         +------- route_evaluation ----> [finish | execute_mcp]
-                                                                     |
-                                                                     v
-                                                                    END
+                         |                                   v
+                   update_memory <--(replan)-- route_evaluation --> [finish | execute_mcp]
+                         |                                                       |
+                         v                                                       v
+                    generate_plan                                               END
 ```
 
 | Node | Purpose |
@@ -433,6 +433,7 @@ retrieve_context -> generate_plan -> generate_motion -> evaluate_motion
 | `generate_plan` | Asks the planner LLM (via Ollama on the Windows host) to decompose the prompt into a Laban-style motion plan (action_type, spatial_level, speed). Falls back to a safe default plan if the LLM is unreachable. |
 | `generate_motion` | Runs the motion diffusion transformer. Writes the prompt in the engine's expected format, invokes inference, then applies smart fallback logic: prefers native FBX, falls back to BVH, or logs an error if neither exists. Always copies the co-generated `.npz` file (SMPL-H pose data) to `temp_motion.npz` so the critic cascade can evaluate the motion via the `SmplhMocap` adapter. |
 | `evaluate_motion` | **4-Stage Critic Cascade.** Runs sequentially -- an earlier failure skips heavier stages: **(1) Kinematic Gatekeeper** checks for foot sliding via forward kinematics (pure Python/numpy); **(2) Semantic Logician** sends a sampled joint trajectory JSON to Llama 3 to verify semantic intent; **(3) Art Director** renders 4 skeleton keyframes with matplotlib and sends the PNG to LLaVA for visual quality scoring; **(4) Human Sign-Off** prints a CLI block and waits for `Y`/`N` input. Requires `bvh`, `matplotlib`, `numpy` (WSL2) and `llava` pulled in Ollama (Windows). |
+| `update_memory` | **(Continuous learning)** Intercepts every rejection before replanning. Encodes the critic feedback into a 384-dim vector using `all-MiniLM-L6-v2` (sentence-transformers) and inserts it into the `motion_corrections` Milvus collection so future runs can retrieve it as historical context. Skips gracefully if Milvus is offline. |
 | `execute_mcp` | (Conditional) When only a BVH was produced, contacts the Windows FastMCP Blender server via SSE to convert it to FBX. |
 
 ### Full Source

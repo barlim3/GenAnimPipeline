@@ -8,10 +8,15 @@ A multi-agent text-to-motion generative pipeline that converts natural-language 
         v
   [ graph.py LangGraph Orchestrator ]
         |
-        +---> Milvus Vector DB (historical corrections)
+        +---> Milvus Vector DB (retrieve historical corrections)
         +---> Llama-3 via Ollama (symbolic motion plan)
         +---> HY-Motion-1.0 DiT (3D animation generation)
         +---> Critic (quality gate)
+        |       |
+        |       +-- reject --> Milvus Vector DB (store new correction)
+        |                           |
+        |                           +--> replan loop
+        |
         +---> Blender via MCP (BVH-to-FBX fallback)
         |
         v
@@ -23,8 +28,9 @@ graph TD
     A[User Prompt]
     B["Retrieve Context<br>(Milvus)"]
     C["Generate Plan<br>(Llama 3)"]
-    D["Generate Motion<br>(HY-Motion/Kimodo)"]
+    D["Generate Motion<br>(HY-Motion)"]
     E{"Evaluate Motion<br>(Critic Cascade)"}
+    H["Update Memory<br>(Sentence Transformers + Milvus)"]
     F["FastMCP Translation<br>(Blender)"]
     G(["Finish: Final FBX"])
 
@@ -33,21 +39,24 @@ graph TD
     B --> C
     C --> D
     D --> E
-    
+
     %% Routing Logic
-    E -- "Fail / Replan" --> C
+    E -- "Fail / Replan" --> H
+    H -- "Correction stored" --> C
     E -- "Pass / Native FBX" --> G
     E -- "Pass / Fallback BVH" --> F
-    
+
     F --> G
 
     %% Styling
     classDef default fill:#2D3748,stroke:#4A5568,stroke-width:2px,color:#fff;
     classDef decision fill:#744210,stroke:#B7791F,stroke-width:2px,color:#fff;
     classDef endpoint fill:#22543D,stroke:#48BB78,stroke-width:2px,color:#fff;
-    
+    classDef memory fill:#1A365D,stroke:#4299E1,stroke-width:2px,color:#fff;
+
     class E decision;
     class G endpoint;
+    class H memory;
 ```
 ## Architecture Overview
 
@@ -186,7 +195,7 @@ The Milvus vector database stores historical motion correction rules as 384-dime
   ```
   Then recreate the Milvus collection.
 
-> **Note:** The embedding model is used only at data ingestion time (adding correction rules). The pipeline's `retrieve_context_node` currently connects to Milvus but does not yet perform semantic search queries -- this is a placeholder for future expansion.
+> **Note:** The embedding model is used at two points in the pipeline: **read** — `retrieve_context_node` loads the `motion_corrections` collection at the start of each run; **write** — `update_memory_node` encodes every critic rejection into a 384-dim vector via `all-MiniLM-L6-v2` and inserts it into Milvus before replanning, making the system continuously learn from its mistakes.
 
 ---
 
