@@ -73,6 +73,8 @@ DEFAULT_PROMPT = "A character performs a heavy broadsword swing."
 # -- Animation Parameters --
 GLOBAL_DURATION = 5       # Animation length in seconds
 MOTION_SEED = 999         # Reproducibility seed for HY-Motion inference
+MOTION_BATCH_SIZE = 4     # Candidates generated per run; best scorer is kept (--num_seeds in HY-Motion)
+                          # Override at runtime with: python graph.py --batch-size <n>
 
 # -- Planner LLM (Ollama API on Windows host) --
 # Change PLANNER_MODEL to any Ollama-pulled model (e.g. "mistral", "gemma2", "phi3")
@@ -292,8 +294,14 @@ def generate_motion_node(state: PipelineState):
         f.write(f"{prompt}#{GLOBAL_DURATION}#{MOTION_SEED}\n")
     logger.debug("[generate_motion] Wrote prompt file: %s", prompt_file_path)
 
-    command = ["python", MOTION_ENGINE_SCRIPT, "--model_path", MOTION_ENGINE_CHECKPOINT, "--input_text_dir", "prompt_inputs"]
+    command = [
+        "python", MOTION_ENGINE_SCRIPT,
+        "--model_path", MOTION_ENGINE_CHECKPOINT,
+        "--input_text_dir", "prompt_inputs",
+        "--num_seeds", str(MOTION_BATCH_SIZE),
+    ]
     logger.debug("[generate_motion] Command: %s (cwd=%s)", " ".join(command), MOTION_ENGINE_DIR)
+    logger.info("[generate_motion] Batch size: %d candidate(s) will be scored; best is kept.", MOTION_BATCH_SIZE)
 
     asset_path = ""
 
@@ -301,30 +309,48 @@ def generate_motion_node(state: PipelineState):
         subprocess.run(command, cwd=MOTION_ENGINE_DIR, check=True)
         logger.info("[generate_motion] Inference complete. Scanning output directory...")
 
-        # --- SMART FALLBACK LOGIC ---
-        # Prefer native FBX (game-engine ready); fall back to BVH (raw skeleton data).
-        # HY-Motion always co-generates .npz files (SMPL-H pose data) alongside
-        # the FBX -- copy those too so the critic cascade can evaluate kinematics
-        # and render skeleton previews from the raw joint data.
         output_dir = os.path.join(MOTION_ENGINE_DIR, "output")
-        fbx_files = glob.glob(f"{output_dir}/**/*.fbx", recursive=True)
-        bvh_files = glob.glob(f"{output_dir}/**/*.bvh", recursive=True)
-        npz_files = glob.glob(f"{output_dir}/**/*.npz", recursive=True)
+        fbx_files = sorted(glob.glob(f"{output_dir}/**/*.fbx", recursive=True))
+        bvh_files = sorted(glob.glob(f"{output_dir}/**/*.bvh", recursive=True))
+        npz_files = sorted(glob.glob(f"{output_dir}/**/*.npz", recursive=True))
         logger.debug("[generate_motion] Found — FBX: %s | BVH: %s | NPZ: %s",
                      fbx_files, bvh_files, npz_files)
 
         if fbx_files:
-            logger.info("[generate_motion] Native FBX detected. Copying to %s.", OUTPUT_FBX_PATH)
-            shutil.copy(fbx_files[0], OUTPUT_FBX_PATH)
+            # --- BEST-OF-BATCH SELECTION ---
+            # Score every FBX candidate through automated critic stages 1-3.
+            # Stage 4 (human sign-off) is reserved for the winner only.
+            if len(fbx_files) == 1:
+                best_fbx = fbx_files[0]
+                best_npz = npz_files[0] if npz_files else None
+                logger.info("[generate_motion] Single candidate — skipping batch scoring.")
+            else:
+                best_fbx, best_npz, best_score = fbx_files[0], None, -1.0
+                for fbx in fbx_files:
+                    stem = fbx.rsplit(".", 1)[0]
+                    npz = stem + ".npz"
+                    if not os.path.exists(npz):
+                        npz_match = [n for n in npz_files if n.startswith(stem)]
+                        npz = npz_match[0] if npz_match else None
+                    score = _score_candidate(npz, prompt) if npz else 0.0
+                    logger.info("[generate_motion] Candidate %s → score %.2f",
+                                os.path.basename(fbx), score)
+                    if score > best_score:
+                        best_score, best_fbx, best_npz = score, fbx, npz
+                logger.info("[generate_motion] Winner: %s (score=%.2f)",
+                            os.path.basename(best_fbx), best_score)
+
+            shutil.copy(best_fbx, OUTPUT_FBX_PATH)
             asset_path = OUTPUT_FBX_PATH
-            # Preserve BVH if it exists (unlikely for HY-Motion, but handled).
+            logger.info("[generate_motion] Best FBX copied to %s.", OUTPUT_FBX_PATH)
+
             if bvh_files:
                 shutil.copy(bvh_files[0], OUTPUT_BVH_PATH)
                 logger.debug("[generate_motion] Co-generated BVH copied to %s.", OUTPUT_BVH_PATH)
-            # Always preserve the NPZ (SMPL-H pose data) for the critic cascade.
-            if npz_files:
-                shutil.copy(npz_files[0], OUTPUT_NPZ_PATH)
-                logger.debug("[generate_motion] SMPL-H NPZ copied to %s.", OUTPUT_NPZ_PATH)
+            if best_npz and os.path.exists(best_npz):
+                shutil.copy(best_npz, OUTPUT_NPZ_PATH)
+                logger.debug("[generate_motion] Winning NPZ copied to %s.", OUTPUT_NPZ_PATH)
+
         elif bvh_files:
             logger.info("[generate_motion] No FBX found — falling back to BVH. Copying to %s.", OUTPUT_BVH_PATH)
             shutil.copy(bvh_files[0], OUTPUT_BVH_PATH)
@@ -884,6 +910,43 @@ def _stage4_human_sign_off(prompt, ai_score, ai_feedback, asset_path):
     return 1.0, "Human approved."
     
 
+# ── Batch Candidate Scorer ────────────────────────────────────────────────
+
+def _score_candidate(npz_path: str, prompt: str) -> float:
+    """Run automated critic stages 1–3 on a single motion candidate NPZ.
+
+    Used by generate_motion_node to rank all batch outputs and select the best
+    one before passing it to the full evaluate_motion_node (which adds the
+    human sign-off gate).  Stage 4 is intentionally excluded here -- it only
+    runs once on the winning candidate.
+
+    Returns a composite score 0.0–1.0 (average of the three stage scores).
+    Returns 0.0 if the file cannot be loaded or has insufficient frames.
+    """
+    try:
+        mocap = SmplhMocap(npz_path)
+    except Exception as e:
+        logger.warning("[batch_score] Could not load %s: %s", npz_path, e)
+        return 0.0
+
+    if mocap.nframes < 2:
+        logger.warning("[batch_score] %s has fewer than 2 frames — scoring 0.", npz_path)
+        return 0.0
+
+    _, s1, fb1 = _stage1_kinematic_gatekeeper(mocap)
+    logger.debug("[batch_score] %s  stage1=%.2f  (%s)", os.path.basename(npz_path), s1, fb1)
+
+    _, s2, fb2 = _stage2_semantic_logician(mocap, prompt)
+    logger.debug("[batch_score] %s  stage2=%.2f  (%s)", os.path.basename(npz_path), s2, fb2)
+
+    _, s3, fb3 = _stage3_art_director(mocap, prompt)
+    logger.debug("[batch_score] %s  stage3=%.2f  (%s)", os.path.basename(npz_path), s3, fb3)
+
+    composite = (s1 + s2 + s3) / 3.0
+    logger.info("[batch_score] %s  composite=%.2f", os.path.basename(npz_path), composite)
+    return composite
+
+
 # ============================================================================
 # CRITIC CASCADE - MAIN NODE
 # ============================================================================
@@ -1143,12 +1206,35 @@ workflow.add_edge("execute_mcp", END)
 app = workflow.compile()
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="GenAnimPipeline — Text-to-Motion Orchestrator")
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help=(
+            "Number of motion candidates HY-Motion generates per run. "
+            "The best-scoring candidate is kept; the rest are discarded. "
+            f"Defaults to MOTION_BATCH_SIZE in config (currently {MOTION_BATCH_SIZE})."
+        ),
+    )
+    parser.add_argument(
+        "--prompt", type=str, default=None,
+        help=f"Motion description to generate. Defaults to DEFAULT_PROMPT in config.",
+    )
+    args = parser.parse_args()
+
+    if args.batch_size is not None:
+        MOTION_BATCH_SIZE = args.batch_size
+
+    prompt = args.prompt if args.prompt is not None else DEFAULT_PROMPT
+
     logger.info("══════════════════════════════════════════════════════")
     logger.info("  GENERATIVE ANIMATION PIPELINE — STARTING")
-    logger.info("  Prompt    : %s", DEFAULT_PROMPT)
-    logger.info("  Log file  : %s", LOG_FILE)
+    logger.info("  Prompt     : %s", prompt)
+    logger.info("  Batch size : %d", MOTION_BATCH_SIZE)
+    logger.info("  Log file   : %s", LOG_FILE)
     logger.info("══════════════════════════════════════════════════════")
-    app.invoke({"prompt": DEFAULT_PROMPT, "iteration_count": 0})
+    app.invoke({"prompt": prompt, "iteration_count": 0})
     logger.info("══════════════════════════════════════════════════════")
     logger.info("  PIPELINE COMPLETE")
     logger.info("══════════════════════════════════════════════════════")
