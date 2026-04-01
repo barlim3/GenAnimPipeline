@@ -472,7 +472,20 @@ venv\Scripts\activate
 python translate_to_fbx.py
 ```
 
-### Step 3: Trigger the Orchestrator (WSL2)
+### Step 3: Launch the Dashboard (Windows — Optional)
+
+Open a Windows Command Prompt or PowerShell to start the browser-based GUI. *Leave this window open in the background.*
+
+```
+cd E:\GenAnimPipeline\dashboard
+python server.py
+```
+
+Open `http://localhost:8080` in your browser. The dashboard provides a 3D viewport for previewing FBX output, pipeline node controls, and a terminal console. Select any `.fbx` file from the viewport dropdown to load and loop its animation.
+
+> **No build step required.** The dashboard loads React, Tailwind CSS, and Three.js from CDNs. Only Python (already installed for the MCP server) is needed to run `server.py`.
+
+### Step 4: Trigger the Orchestrator (WSL2)
 
 Open your WSL2 terminal, activate the PyTorch cu130 environment, and launch the workflow. Ensure the `GLOBAL_DURATION` and other settings in the configuration block at the top of `graph.py` are set to your desired values before running.
 

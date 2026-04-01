@@ -327,8 +327,12 @@ GenAnimPipeline/
   graph.py                  # LangGraph orchestrator (main entry point)
   init_milvus.py            # One-time Milvus collection setup
   docker-compose.yml        # Milvus deployment (etcd + minio + milvus)
-  WALKTHROUGH.md            # Full deployment guide (Phases 1-7)
+  SETUP.md                  # Full deployment guide (Phases 1-7)
   README.md                 # This file
+  dashboard/
+    index.html              # Dashboard entry point (loads React, Tailwind, Three.js via CDN)
+    App.jsx                 # Single-file React dashboard application
+    server.py               # Dev server — serves dashboard + API for FBX file listing
   mcp_server/
     translate_to_fbx.py     # FastMCP Blender translation server
     blender_retarget.py     # Blender Python script for BVH-to-FBX
@@ -340,6 +344,30 @@ GenAnimPipeline/
   volumes/                  # Docker volumes for Milvus data persistence
 ```
 
+## Dashboard
+
+A browser-based GUI for visualizing pipeline state, previewing FBX output, and triggering mock pipeline runs. No build step required — all dependencies (React, Tailwind CSS, Three.js) load from CDNs.
+
+**Start the dashboard:**
+```
+cd E:\GenAnimPipeline\dashboard
+python server.py
+```
+Then open `http://localhost:8080`.
+
+**Features:**
+- 3D viewport with FBX file selector — loads any `.fbx` from the project root and loops embedded animations
+- LangGraph node topology with per-node bypass toggles
+- Parameter panel (duration, diffusion model, critic threshold, etc.)
+- Auto-scrolling terminal console with timestamped pipeline logs
+- Mock execution sequence that steps through all 5 pipeline stages
+
+The dashboard server exposes two API routes used internally:
+| Route | Purpose |
+|---|---|
+| `GET /api/fbx-files` | Returns a JSON array of `.fbx` file paths found under the project root |
+| `GET /assets/<path>` | Serves an FBX binary from the project root (used by the Three.js FBXLoader) |
+
 ## Getting Started
 
-See [WALKTHROUGH.md](WALKTHROUGH.md) for the complete setup guide covering all seven deployment phases, from WSL2 configuration through first pipeline run.
+See [SETUP.md](SETUP.md) for the complete setup guide covering all seven deployment phases, from WSL2 configuration through first pipeline run.
