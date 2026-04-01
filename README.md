@@ -17,7 +17,38 @@ A multi-agent text-to-motion generative pipeline that converts natural-language 
         v
   final_animation.fbx
 ```
+```mermaid
+graph TD
+    %% Define Nodes
+    A[User Prompt]
+    B["Retrieve Context<br>(Milvus)"]
+    C["Generate Plan<br>(Llama 3)"]
+    D["Generate Motion<br>(HY-Motion/Kimodo)"]
+    E{"Evaluate Motion<br>(Critic Cascade)"}
+    F["FastMCP Translation<br>(Blender)"]
+    G(["Finish: Final FBX"])
 
+    %% Define Flow
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    
+    %% Routing Logic
+    E -- "Fail / Replan" --> C
+    E -- "Pass / Native FBX" --> G
+    E -- "Pass / Fallback BVH" --> F
+    
+    F --> G
+
+    %% Styling
+    classDef default fill:#2D3748,stroke:#4A5568,stroke-width:2px,color:#fff;
+    classDef decision fill:#744210,stroke:#B7791F,stroke-width:2px,color:#fff;
+    classDef endpoint fill:#22543D,stroke:#48BB78,stroke-width:2px,color:#fff;
+    
+    class E decision;
+    class G endpoint;
+```
 ## Architecture Overview
 
 The pipeline runs as a hybrid WSL2/Windows system:
