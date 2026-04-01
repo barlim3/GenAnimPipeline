@@ -178,10 +178,21 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    pip install huggingface_hub
    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='tencent/HY-Motion-1.0', local_dir='ckpts/tencent/HY-Motion-1.0', local_dir_use_symlinks=False)"
    pip install -U "huggingface_hub[cli]"
+
    # Example for Standard version
    huggingface-cli download tencent/HY-Motion-1.0 --include "HY-Motion-1.0/*" --local-dir ckpts/tencent
+
    # Example for Lite version
    huggingface-cli download tencent/HY-Motion-1.0 --include "HY-Motion-1.0-Lite/*" --local-dir ckpts/tencent
+
+   # CLIP Large
+   huggingface-cli download openai/clip-vit-large-patch14 --local-dir ckpts/clip-vit-large-patch14/
+
+   # Qwen Text Encoder
+   huggingface-cli download Qwen/Qwen3-8B --local-dir ckpts/Qwen3-8B
+
+   # Optional
+   huggingface-cli download Text2MotionPrompter/Text2MotionPrompter --local-dir ckpts/Text2MotionPrompter
    ```
 
 ### 2. The VRAM Bypass Patch
