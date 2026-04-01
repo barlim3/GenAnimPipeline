@@ -41,8 +41,8 @@ graph TD
     D --> E
 
     %% Routing Logic
-    E -- "Fail / Replan" --> H
-    H -- "Correction stored" --> C
+    E -- "Fail: store correction" --> H
+    H -- "Replan" --> C
     E -- "Pass / Native FBX" --> G
     E -- "Pass / Fallback BVH" --> F
 

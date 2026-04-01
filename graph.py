@@ -176,19 +176,61 @@ class PipelineState(TypedDict):
     final_asset_path: str       # Absolute path to the output file (.fbx or .bvh)
 
 def retrieve_context_node(state: PipelineState):
-    """Node 1: Connect to the Milvus vector database and load historical motion
-    correction rules. These embeddings let the planner avoid known failure modes.
-    Gracefully degrades if Milvus is offline -- the pipeline continues without context."""
+    """Node 1: Query the Milvus vector database for historical motion correction rules.
+
+    Implements hybrid multi-tenant retrieval:
+      - Searches across the active project partition AND Global_Rules simultaneously
+        so universal physics/kinematics rules are always considered.
+      - Filters results by animation style (or the universal 'physics' tag) to keep
+        retrieved context relevant to the current task.
+
+    Gracefully degrades if Milvus is offline -- the pipeline continues without context.
+    """
     _log_input("retrieve_context", ["prompt"], state)
     logger.info("[retrieve_context] Connecting to Milvus at %s:%s ...", MILVUS_HOST, MILVUS_PORT)
     historical_context = []
+
+    # -- Query placeholders (swap for dynamic values when multi-project support is added) --
+    active_project    = "ProjectA"
+    requested_style   = "combat"
+
     try:
         connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
         collection = Collection(MILVUS_COLLECTION)
         collection.load()
         logger.info("[retrieve_context] Milvus connected. Collection '%s' loaded.", MILVUS_COLLECTION)
+
+        # Encode the prompt into a query vector using the same model as the writer.
+        query_model     = SentenceTransformer("all-MiniLM-L6-v2")
+        query_embedding = query_model.encode(state["prompt"]).tolist()
+        logger.debug("[retrieve_context] Query embedding generated (%d dims).", len(query_embedding))
+
+        search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+        results = collection.search(
+            data            = [query_embedding],
+            anns_field      = "embedding",
+            param           = search_params,
+            limit           = 5,
+            expr            = f"style == '{requested_style}' or style == 'physics'",
+            partition_names = [active_project, "Global_Rules"],
+            output_fields   = ["text"],
+        )
+
+        for hits in results:
+            for hit in hits:
+                text = hit.entity.get("text")
+                if text:
+                    historical_context.append(text)
+
+        logger.info(
+            "[retrieve_context] Retrieved %d correction rule(s) "
+            "(partitions: %s + Global_Rules, style filter: '%s' | 'physics').",
+            len(historical_context), active_project, requested_style,
+        )
+
     except Exception as e:
         logger.warning("[retrieve_context] Vector DB not available — continuing without context. Error: %s", e)
+
     result = {"historical_context": historical_context}
     _log_output("retrieve_context", result)
     return result
@@ -1014,9 +1056,15 @@ def update_memory_node(state: PipelineState):
     Only activates on genuine rejections -- human approvals and no-data passes are
     ignored so the collection only accumulates actionable correction rules.
 
+    Hybrid multi-tenant routing
+    ---------------------------
+    current_project  : physical partition target (ProjectA / ProjectB / Global_Rules)
+    motion_style     : scalar metadata tag written alongside the embedding so
+                       retrieve_context_node can filter by style at query time.
+
     Embedding model : all-MiniLM-L6-v2  (384-dim, ~80 MB, CPU-friendly)
     Collection      : motion_corrections (pre-created by init_milvus.py)
-    Insert format   : [[embedding_list], [feedback_text]]  (Milvus column-per-field)
+    Insert format   : [[embedding], [text], [style]]  (Milvus column-per-field)
     """
     _log_input("update_memory", ["critic_feedback", "critic_score", "iteration_count"], state)
     feedback = state.get("critic_feedback", "")
@@ -1029,6 +1077,10 @@ def update_memory_node(state: PipelineState):
     logger.info("[update_memory] Rejection detected — vectorizing feedback for long-term memory...")
     logger.debug("[update_memory] Feedback: %s", feedback)
 
+    # -- Routing placeholders (swap for dynamic values when multi-project support is added) --
+    current_project = "ProjectA"
+    motion_style    = "combat"
+
     try:
         model = SentenceTransformer("all-MiniLM-L6-v2")
         embedding = model.encode(feedback).tolist()
@@ -1037,14 +1089,17 @@ def update_memory_node(state: PipelineState):
         connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
         collection = Collection(MILVUS_COLLECTION)
         collection.load()
-        collection.insert([[embedding], [feedback]])
+        collection.insert([[embedding], [feedback], [motion_style]], partition_name=current_project)
         collection.flush()
-        logger.info("[update_memory] Correction rule saved to Milvus collection '%s'.", MILVUS_COLLECTION)
+        logger.info(
+            "[update_memory] Correction rule saved — partition='%s', style='%s'.",
+            current_project, motion_style,
+        )
 
     except Exception as e:
         logger.warning("[update_memory] Could not write to Milvus — pipeline will continue. Error: %s", e)
 
-    _log_output("update_memory", {"stored_feedback": feedback})
+    _log_output("update_memory", {"stored_feedback": feedback, "partition": current_project, "style": motion_style})
     return state
 
 
