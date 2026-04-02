@@ -1,0 +1,51 @@
+{
+  "_comment": "GenAnimPipeline — central configuration. All hardcoded defaults live here. Paths are relative to the project root (graph.py location). Override any value via CLI args where supported.",
+
+  "default_prompt": "A character performs a heavy broadsword swing.",
+
+  "animation": {
+    "global_duration": 5,
+    "motion_seed": 999,
+    "motion_batch_size": 4
+  },
+
+  "ollama": {
+    "port": 11434,
+    "planner_model": "llama3:latest",
+    "vision_model": "llava:latest"
+  },
+
+  "prompt_rewriter": "ollama",
+
+  "motion_engine": {
+    "dir": "HY-Motion-1.0",
+    "checkpoint": "ckpts/tencent/HY-Motion-1.0",
+    "script": "local_infer.py"
+  },
+
+  "milvus": {
+    "host": "localhost",
+    "port": "19530",
+    "collection": "motion_corrections"
+  },
+
+  "output": {
+    "fbx_path": "final_animation.fbx",
+    "bvh_path": "temp_motion.bvh",
+    "npz_path": "temp_motion.npz"
+  },
+
+  "mcp": {
+    "server_port": 8000
+  },
+
+  "critic": {
+    "score_threshold": 0.85,
+    "max_iterations": 3
+  },
+
+  "logging": {
+    "level": "DEBUG",
+    "file": "pipeline.log"
+  }
+}

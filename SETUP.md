@@ -2,7 +2,7 @@
 
 This architecture utilizes a hybrid system: AI inference and multi-agent orchestration run within a Windows Subsystem for Linux (WSL2) environment, while native Windows acts as a hardware-accelerated fallback server for asset translation via Blender and the Model Context Protocol (MCP).
 
-All model-specific settings (LLM name, motion engine paths, service ports, etc.) are centralized in configuration blocks at the top of each source file. To swap a model or change an endpoint, update only the config block -- the pipeline flow stays untouched.
+All model-specific settings (LLM name, motion engine paths, service ports, etc.) are centralized in `pipeline_config.json` at the project root. To swap a model or change an endpoint, edit only that file — the pipeline flow stays untouched. Node implementations live in `pipeline/nodes/`; shared infrastructure (logger, config loader, path helpers) lives in `pipeline/shared.py`.
 
 ## System Requirements
 
@@ -124,9 +124,9 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 
    > **LLaVA VRAM:** LLaVA (7B) requires ~4-8 GB VRAM. Like the planner, the critic passes `"keep_alive": 0` so Ollama releases it immediately after scoring. If VRAM is tight, set `OLLAMA_NUM_GPU=0` to run LLaVA on CPU -- inference will be slower (~10-30s per evaluation) but the result is the same.
    >
-   > **Swapping the vision model:** To use a larger or different multimodal model (e.g., `llava:13b`, `bakllava`), pull it and update `VISION_MODEL` in `graph.py`.
+   > **Swapping the vision model:** To use a larger or different multimodal model (e.g., `llava:13b`, `bakllava`), pull it and update `vision_model` under `ollama` in `pipeline_config.json`.
 
-> **Swapping the planner model:** To use a different LLM (e.g., Mistral, Gemma2, Phi3), pull it with `ollama pull <model>` and update `PLANNER_MODEL` in the configuration block at the top of `graph.py`. No other code changes are needed.
+> **Swapping the planner model:** To use a different LLM (e.g., Mistral, Gemma2, Phi3), pull it with `ollama pull <model>` and update `planner_model` under `ollama` in `pipeline_config.json`. No other code changes are needed.
 
 > **VRAM isolation (optional):** The planner and HY-Motion share the same physical GPU. By default, `graph.py` passes `"keep_alive": 0` in the Ollama request to immediately free VRAM after planning. For full GPU isolation, add a second system environment variable alongside `OLLAMA_HOST`:
 > * **Variable name:** `OLLAMA_NUM_GPU`
@@ -217,7 +217,7 @@ To prevent VRAM explosion, we must bypass HY-Motion's internal 40GB LLM and set 
            return dynamic_duration, text
    ```
 
-> **Swapping the motion engine:** To use a different motion generation model, update `MOTION_ENGINE_DIR`, `MOTION_ENGINE_CHECKPOINT`, and `MOTION_ENGINE_SCRIPT` in the configuration block at the top of `graph.py`. You will also need to adjust the prompt format in `generate_motion_node()` to match the new engine's expected input.
+> **Swapping the motion engine:** Update `dir`, `checkpoint`, and `script` under `motion_engine` in `pipeline_config.json`. You will also need to adjust the prompt format in `pipeline/nodes/motion.py` (`generate_motion_node`) to match the new engine's expected input.
 
 ---
 
@@ -362,56 +362,80 @@ This natively runs Blender on Windows to bind the mesh if HY-Motion's native .fb
 
 ## Phase 7: The Master LangGraph Orchestrator (WSL2)
 
-Create `graph.py` in `/mnt/e/GenAnimPipeline` (or use the existing file). This contains the fault-tolerant router that prefers native .fbx but seamlessly fails over to .bvh + Blender.
+The pipeline entry point is `graph.py`, but it is now a thin orchestrator — it only wires nodes into the LangGraph graph and handles CLI arguments. All node logic lives in the `pipeline/` package.
 
-### Configuration Block
+### Project Layout
 
-All model and service settings live in the configuration block at the top of `graph.py`. To swap any model or change any endpoint, edit only this section:
-
-```python
-# ============================================================================
-# PIPELINE CONFIGURATION
-# All model and service settings are centralized here. To swap a model or
-# change an endpoint, update only this block -- node functions reference
-# these values by name, keeping the pipeline flow untouched.
-# ============================================================================
-
-# -- Animation Parameters --
-GLOBAL_DURATION = 5       # Animation length in seconds
-MOTION_SEED = 999         # Reproducibility seed for HY-Motion inference
-
-# -- Planner LLM (Ollama API on Windows host) --
-# Change PLANNER_MODEL to any Ollama-pulled model (e.g. "mistral", "gemma2", "phi3")
-PLANNER_MODEL = "llama3"
-VISION_MODEL = "llava"    # LLaVA vision model for critic Stage 3 art direction
-OLLAMA_PORT = 11434
-
-# -- Motion Generation Engine (HY-Motion-1.0 in WSL2) --
-# To swap engines, update these paths and adjust the prompt format in
-# generate_motion_node() to match the new engine's expected input.
-MOTION_ENGINE_DIR = "/mnt/e/GenAnimPipeline/HY-Motion-1.0"
-MOTION_ENGINE_CHECKPOINT = "ckpts/tencent/HY-Motion-1.0"
-MOTION_ENGINE_SCRIPT = "local_infer.py"
-
-# -- Vector Memory (Milvus via Docker) --
-MILVUS_HOST = "localhost"
-MILVUS_PORT = "19530"
-MILVUS_COLLECTION = "motion_corrections"
-
-# -- Output Paths (WSL2 mount) --
-OUTPUT_FBX_PATH = "/mnt/e/GenAnimPipeline/final_animation.fbx"
-OUTPUT_BVH_PATH = "/mnt/e/GenAnimPipeline/temp_motion.bvh"
-OUTPUT_NPZ_PATH = "/mnt/e/GenAnimPipeline/temp_motion.npz"
-
-# -- MCP Blender Fallback (Windows-native paths for the Blender server) --
-MCP_SERVER_PORT = 8000
-WIN_BVH_PATH = "E:\\GenAnimPipeline\\temp_motion.bvh"
-WIN_FBX_PATH = "E:\\GenAnimPipeline\\final_animation.fbx"
-
-# -- Critic / Evaluation Thresholds --
-CRITIC_SCORE_THRESHOLD = 0.85  # Minimum score to accept without re-planning
-MAX_ITERATIONS = 3             # Hard cap on plan-generate-evaluate loops
 ```
+GenAnimPipeline/
+  graph.py                     # Entry point: LangGraph assembly + argparse
+  pipeline_config.json         # All defaults — models, ports, paths, thresholds
+  pipeline/
+    shared.py                  # Config loader, logger, PipelineState, path helpers
+    smplh_adapter.py           # SMPL-H NPZ adapter + FK helpers
+    nodes/
+      memory.py                # retrieve_context_node, update_memory_node
+      planner.py               # generate_symbolic_plan_node + rewriter helpers
+      motion.py                # generate_motion_node
+      critic.py                # Stages 1-4, score_candidate, evaluate_motion_node
+      mcp.py                   # execute_mcp_translation_node
+```
+
+### Configuration
+
+All model and service settings live in `pipeline_config.json`. To swap any model or change any endpoint, edit only this file — no source code changes needed:
+
+```json
+{
+  "default_prompt": "A character performs a heavy broadsword swing.",
+
+  "animation": {
+    "global_duration": 5,
+    "motion_seed": 999,
+    "motion_batch_size": 4
+  },
+
+  "ollama": {
+    "port": 11434,
+    "planner_model": "llama3:latest",
+    "vision_model": "llava:latest"
+  },
+
+  "prompt_rewriter": "ollama",
+
+  "motion_engine": {
+    "dir": "HY-Motion-1.0",
+    "checkpoint": "ckpts/tencent/HY-Motion-1.0",
+    "script": "local_infer.py"
+  },
+
+  "milvus": {
+    "host": "localhost",
+    "port": "19530",
+    "collection": "motion_corrections"
+  },
+
+  "output": {
+    "fbx_path": "final_animation.fbx",
+    "bvh_path": "temp_motion.bvh",
+    "npz_path": "temp_motion.npz"
+  },
+
+  "mcp": { "server_port": 8000 },
+
+  "critic": {
+    "score_threshold": 0.85,
+    "max_iterations": 3
+  },
+
+  "logging": {
+    "level": "DEBUG",
+    "file": "pipeline.log"
+  }
+}
+```
+
+All output paths are relative to the project root. `pipeline/shared.py` resolves them to absolute paths at import time, so the pipeline works regardless of where the repo is cloned.
 
 ### Pipeline Flow
 
@@ -436,13 +460,27 @@ retrieve_context -> generate_plan -> generate_motion -> evaluate_motion
 | `update_memory` | **(Continuous learning)** Intercepts every rejection before replanning. Encodes the critic feedback into a 384-dim vector using `all-MiniLM-L6-v2` (sentence-transformers) and inserts it into the `motion_corrections` Milvus collection so future runs can retrieve it as historical context. Skips gracefully if Milvus is offline. |
 | `execute_mcp` | (Conditional) When only a BVH was produced, contacts the Windows FastMCP Blender server via SSE to convert it to FBX. |
 
-### Full Source
+### Key architectural features
 
-See the `graph.py` file for the complete implementation. The key architectural features:
+* **`pipeline/shared.py`** — Loaded by every module. Reads `pipeline_config.json`, sets up the rotating logger, exposes `PipelineState`, `get_windows_host_ip()`, `log_input()`, `log_output()`, and derived path constants like `WIN_BVH_PATH`.
+* **`PipelineState`** — TypedDict shared across all nodes. Each node reads what it needs and returns a partial dict to merge back into the shared state.
+* **`route_evaluation()`** — Conditional router in `graph.py`: passes to finish (FBX), Blender fallback (BVH), or loops back to re-plan.
+* **`pipeline/smplh_adapter.py`** — Runs standalone for FK/adapter testing: `python -m pipeline.smplh_adapter`.
 
-* **`_get_windows_host_ip()`** -- Shared helper that resolves the Windows host IP from inside WSL2 via the default gateway. Used by any node that reaches the Windows host (Ollama, MCP server).
-* **`PipelineState`** -- TypedDict shared across all nodes. Each node reads what it needs and returns a partial dict to merge back.
-* **`route_evaluation()`** -- Conditional router: passes to finish (FBX), Blender fallback (BVH), or loops back to re-plan.
+### Standalone Module Testing
+
+Each node module has a built-in test runner so stages can be developed and debugged without running the full pipeline:
+
+```bash
+python -m pipeline.smplh_adapter                        # FK math with synthetic NPZ
+python -m pipeline.nodes.memory                         # Milvus retrieval (graceful if offline)
+python -m pipeline.nodes.planner                        # Ollama planner or hymotion passthrough
+python -m pipeline.nodes.planner --rewriter hymotion
+python -m pipeline.nodes.critic                         # Stages 1-3 with synthetic NPZ
+python -m pipeline.nodes.critic path/to/motion.npz      # Stages 1-3 with real file
+python -m pipeline.nodes.motion                         # Dry-run: prints inference command
+python -m pipeline.nodes.mcp                            # SSE connectivity check
+```
 
 ---
 
@@ -487,7 +525,7 @@ Open `http://localhost:8080` in your browser. The dashboard provides a 3D viewpo
 
 ### Step 4: Trigger the Orchestrator (WSL2)
 
-Open your WSL2 terminal, activate the PyTorch cu130 environment, and launch the workflow. Ensure the `GLOBAL_DURATION` and other settings in the configuration block at the top of `graph.py` are set to your desired values before running.
+Open your WSL2 terminal, activate the PyTorch cu130 environment, and launch the workflow. Ensure `pipeline_config.json` is configured to your desired values before running.
 
 ```bash
 conda activate text2motion
@@ -495,16 +533,38 @@ cd /mnt/e/GenAnimPipeline
 python graph.py
 ```
 
+**CLI arguments** — all are optional and override the corresponding config value for that run only:
+
+| Argument | Values | Default | Description |
+|---|---|---|---|
+| `--prompt "..."` | any string | `DEFAULT_PROMPT` | Motion description to generate |
+| `--batch-size N` | integer | `MOTION_BATCH_SIZE` (4) | Number of motion candidates HY-Motion generates; best scorer is kept |
+| `--rewriter` | `ollama` \| `hymotion` | `PROMPT_REWRITER` (`ollama`) | Prompt rewriter to use before generation. `ollama` enriches via Llama3 and falls back to HY-Motion's internal Qwen3 rewriter if unreachable (red alert logged). `hymotion` delegates entirely to the internal rewriter with no fallback alert |
+
+Examples:
+```bash
+# Single candidate, fast iteration
+python graph.py --batch-size 1
+
+# Use HY-Motion's internal Qwen3 rewriter instead of Ollama
+python graph.py --rewriter hymotion
+
+# Full override: custom prompt, 8 candidates, Ollama rewriter
+python graph.py --prompt "A character vaults over an obstacle" --batch-size 8 --rewriter ollama
+```
+
 ---
 
 ## Quick Reference: Swapping Models
 
-| What to swap | Config location | Variables to change |
+| What to swap | Config location | Key(s) to change |
 |---|---|---|
-| Planner LLM | `graph.py` config block | `PLANNER_MODEL`, `OLLAMA_PORT` |
-| Critic vision model (Stage 3) | `graph.py` config block | `VISION_MODEL` (e.g. `"llava:13b"`, `"bakllava"`) |
-| Critic score threshold | `graph.py` config block | `CRITIC_SCORE_THRESHOLD` (default `0.85`) |
-| Motion engine | `graph.py` config block | `MOTION_ENGINE_DIR`, `MOTION_ENGINE_CHECKPOINT`, `MOTION_ENGINE_SCRIPT` (+ prompt format in `generate_motion_node()`) |
-| Vector database | `graph.py` config block | `MILVUS_HOST`, `MILVUS_PORT`, `MILVUS_COLLECTION` |
-| Blender version | `mcp_server/translate_to_fbx.py` config block | `BLENDER_EXE` |
-| MCP server port | Both `graph.py` and `translate_to_fbx.py` | `MCP_SERVER_PORT` / `SERVER_PORT` |
+| Planner LLM | `pipeline_config.json` → `ollama` | `planner_model`, `port` |
+| Prompt rewriter | `pipeline_config.json` or `--rewriter` CLI arg | `prompt_rewriter` (`"ollama"` or `"hymotion"`) |
+| Motion batch size | `pipeline_config.json` → `animation` or `--batch-size` CLI arg | `motion_batch_size` (default `4`) |
+| Critic vision model (Stage 3) | `pipeline_config.json` → `ollama` | `vision_model` (e.g. `"llava:13b"`, `"bakllava"`) |
+| Critic score threshold | `pipeline_config.json` → `critic` | `score_threshold` (default `0.85`) |
+| Motion engine | `pipeline_config.json` → `motion_engine` | `dir`, `checkpoint`, `script` (+ prompt format in `pipeline/nodes/motion.py`) |
+| Vector database | `pipeline_config.json` → `milvus` | `host`, `port`, `collection` |
+| Blender version | `mcp_server/translate_to_fbx.py` | `BLENDER_EXE` |
+| MCP server port | `pipeline_config.json` → `mcp` + `translate_to_fbx.py` | `server_port` / `SERVER_PORT` (must match) |

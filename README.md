@@ -64,13 +64,15 @@ The pipeline runs as a hybrid WSL2/Windows system:
 
 | Component | Runs On | Purpose |
 |---|---|---|
-| `graph.py` (LangGraph) | WSL2 | Central orchestrator -- routes prompts through all models |
+| `graph.py` (LangGraph) | WSL2 | Thin orchestrator — wires nodes into the directed graph, handles CLI args |
+| `pipeline/` modules | WSL2 | Node implementations, SMPL-H adapter, shared config and logger |
+| `pipeline_config.json` | WSL2 | All hardcoded defaults — models, ports, paths, thresholds |
 | Milvus vector database | WSL2 (Docker) | Stores motion correction embeddings for context retrieval |
 | Ollama + Llama 3 | Windows host | Decomposes prompts into structured motion plans |
 | HY-Motion-1.0 | WSL2 | Diffusion transformer that generates 3D skeleton animation |
 | Blender + FastMCP server | Windows host | Safety-net BVH-to-FBX converter (only when needed) |
 
-All model-specific settings are centralized in configuration blocks at the top of `graph.py` and `mcp_server/translate_to_fbx.py`. See [Model Configuration](#model-configuration) for details on swapping or upgrading any model.
+All model-specific settings are centralized in `pipeline_config.json`. To swap a model or change an endpoint, edit only that file — the pipeline flow stays untouched. See [Model Configuration](#model-configuration) for details.
 
 ---
 
@@ -84,7 +86,7 @@ All model-specific settings are centralized in configuration blocks at the top o
 | **Type** | Large Language Model (decoder-only transformer) |
 | **Pipeline stage** | Node 2: `generate_plan` |
 | **Runs on** | Windows host, served by Ollama on port 11434 |
-| **Config variables** | `PLANNER_MODEL`, `OLLAMA_PORT` in `graph.py` |
+| **Config variables** | `planner_model`, `port` under `ollama` in `pipeline_config.json` |
 
 **Role in the pipeline:**
 The planner receives the user's text prompt (e.g., "A character performs a heavy broadsword swing") and produces a structured JSON motion plan with Laban movement analysis properties:
@@ -106,11 +108,11 @@ This symbolic plan gives the downstream motion generator structured context beyo
 
 **How to replace or upgrade:**
 1. Pull a different model: `ollama pull <model-name>` (e.g., `mistral`, `gemma2`, `phi3`, `llama3.1`)
-2. Update one line in `graph.py`:
-   ```python
-   PLANNER_MODEL = "mistral"  # or any Ollama-compatible model name
+2. Update one line in `pipeline_config.json`:
+   ```json
+   "planner_model": "mistral"
    ```
-3. No other code changes are needed. The Ollama API is model-agnostic -- the same `/api/generate` endpoint works for all models.
+3. No other code changes are needed. The Ollama API is model-agnostic — the same `/api/generate` endpoint works for all models.
 
 > **VRAM isolation:** The pipeline passes `"keep_alive": 0` in the Ollama API request, which tells Ollama to immediately unload the planner model from VRAM after responding. This frees the GPU before HY-Motion starts its diffusion pass. For full isolation (the planner never touches the GPU at all), set the Windows system environment variable `OLLAMA_NUM_GPU=0` and restart Ollama. This forces CPU-only inference for the planner -- adding only 2-3 seconds for a single JSON response, negligible compared to the diffusion pass.
 >
@@ -126,7 +128,7 @@ This symbolic plan gives the downstream motion generator structured context beyo
 | **Type** | Diffusion Transformer (DiT) with Flow Matching |
 | **Pipeline stage** | Node 3: `generate_motion` |
 | **Runs on** | WSL2, invoked via `local_infer.py` |
-| **Config variables** | `MOTION_ENGINE_DIR`, `MOTION_ENGINE_CHECKPOINT`, `MOTION_ENGINE_SCRIPT` in `graph.py` |
+| **Config variables** | `dir`, `checkpoint`, `script` under `motion_engine` in `pipeline_config.json` |
 
 **Role in the pipeline:**
 This is the core generative model. It takes the text prompt and duration, runs a diffusion process over learned motion distributions, and outputs skeleton-based 3D character animation data (SMPL-H format, 52 joints at 30 FPS). HY-Motion produces both an FBX file (game-engine ready) and an NPZ file (raw SMPL-H pose parameters: axis-angle rotations for 52 joints + root translation per frame). The pipeline copies both: FBX to `final_animation.fbx` (primary output) and NPZ to `temp_motion.npz` (used by the critic cascade via the `SmplhMocap` adapter for kinematic and visual evaluation). If only BVH is produced (e.g., from a different motion engine), it is copied to `temp_motion.bvh` and the Blender fallback is triggered.
@@ -156,13 +158,15 @@ Example: `A character performs a heavy broadsword swing.#5#999`
 
 **How to replace or upgrade:**
 1. Clone or download the new motion model to a directory accessible from WSL2.
-2. Update three variables in `graph.py`:
-   ```python
-   MOTION_ENGINE_DIR = "/mnt/e/GenAnimPipeline/NewMotionModel"
-   MOTION_ENGINE_CHECKPOINT = "path/to/checkpoint"
-   MOTION_ENGINE_SCRIPT = "inference.py"  # the new model's entry script
+2. Update `pipeline_config.json`:
+   ```json
+   "motion_engine": {
+     "dir": "NewMotionModel",
+     "checkpoint": "path/to/checkpoint",
+     "script": "inference.py"
+   }
    ```
-3. Adapt the prompt format in `generate_motion_node()` to match the new model's expected input. The current format (`text#duration#seed`) is HY-Motion-specific.
+3. Adapt the prompt format in `pipeline/nodes/motion.py` (`generate_motion_node`) to match the new model's expected input. The current format (`text#duration#seed`) is HY-Motion-specific.
 4. Ensure the new model outputs `.fbx` or `.bvh` files to a predictable output directory. The smart fallback logic in `generate_motion_node()` scans the output directory recursively for both formats.
 
 > **Upgrade path:** HY-Motion-1.0-Lite (0.46B parameters) is available for lower-VRAM setups. To use it, change `MOTION_ENGINE_CHECKPOINT` to `"ckpts/tencent/HY-Motion-1.0-Lite"`. Future motion models (e.g., MotionDiffuse, MDM, MLD) can be integrated by pointing to their directory and adapting the prompt format.
@@ -177,7 +181,7 @@ Example: `A character performs a heavy broadsword swing.#5#999`
 | **Type** | Sentence Transformer / Text Embedding Model |
 | **Pipeline stage** | Node 1: `retrieve_context` (query) + offline ingestion (write) |
 | **Runs on** | Wherever embeddings are generated before insertion into Milvus |
-| **Config variables** | `MILVUS_HOST`, `MILVUS_PORT`, `MILVUS_COLLECTION` in `graph.py` |
+| **Config variables** | `host`, `port`, `collection` under `milvus` in `pipeline_config.json` |
 
 **Role in the pipeline:**
 The Milvus vector database stores historical motion correction rules as 384-dimensional embeddings. When the pipeline starts, `retrieve_context_node` connects to Milvus and loads relevant corrections so the planner can avoid known failure modes. The embedding model is used at ingestion time (when adding new correction rules) to convert text into vectors.
@@ -188,7 +192,7 @@ The Milvus vector database stores historical motion correction rules as 384-dime
 - An embedding model that produces 384-dim vectors for ingestion (e.g., `sentence-transformers/all-MiniLM-L6-v2`)
 
 **How to replace or upgrade:**
-- **Changing the vector database:** Update `MILVUS_HOST`, `MILVUS_PORT`, and `MILVUS_COLLECTION` in `graph.py`. The `retrieve_context_node` uses the PyMilvus client, so any Milvus-compatible backend works.
+- **Changing the vector database:** Update `host`, `port`, and `collection` under `milvus` in `pipeline_config.json`. The `retrieve_context_node` uses the PyMilvus client, so any Milvus-compatible backend works.
 - **Changing the embedding model:** Update the ingestion script to use a different model. If the new model produces a different vector dimension, update `init_milvus.py` to match:
   ```python
   FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=768)  # e.g., for a 768-dim model
@@ -207,7 +211,7 @@ The Milvus vector database stores historical motion correction rules as 384-dime
 | **Type** | Multi-stage validation funnel (physics → LLM → vision → human) |
 | **Pipeline stage** | Node 4: `evaluate_motion` |
 | **Runs on** | WSL2 (Stages 1, 2, 3 compute) + terminal blocking prompt (Stage 4) |
-| **Config variables** | `CRITIC_SCORE_THRESHOLD`, `MAX_ITERATIONS`, `VISION_MODEL` in `graph.py` |
+| **Config variables** | `score_threshold`, `max_iterations` under `critic`; `vision_model` under `ollama` in `pipeline_config.json` |
 
 **Role in the pipeline:**
 The critic evaluates generated motion quality on a 0.0-1.0 scale through four sequential stages. If any stage fails, it immediately returns its score and skips all heavier downstream stages. The `route_evaluation` function uses the final score:
@@ -237,13 +241,15 @@ The critic accepts two input formats, tried in this order:
 2. **SMPL-H NPZ file** (parsed via the `SmplhMocap` adapter in `graph.py`) -- used when HY-Motion outputs FBX+NPZ without a BVH. The adapter converts axis-angle rotations to ZXY Euler angles and exposes the same API as the `bvh` library, so all four stages work identically on both formats. Spatial values are scaled from metres to centimetres to match the kinematic thresholds.
 
 **How to swap the vision model:**
-Change `VISION_MODEL` in `graph.py`:
-```python
-VISION_MODEL = "llava:13b"  # or "bakllava", "llava:34b", etc.
+Update `pipeline_config.json`:
+```json
+"ollama": {
+  "vision_model": "llava:13b"
+}
 ```
 
 **How to swap the semantic model:**
-The semantic logician reuses `PLANNER_MODEL` and `OLLAMA_PORT`, so swapping the planner automatically upgrades Stage 2 as well.
+The semantic logician reuses `planner_model` and `port` from the `ollama` block in `pipeline_config.json`, so swapping the planner automatically upgrades Stage 2 as well.
 
 ---
 
@@ -272,51 +278,85 @@ When HY-Motion produces only a `.bvh` file (raw skeleton data without mesh bindi
 
 ## Model Configuration
 
-All model settings are centralized in configuration blocks. Here is a quick reference for swapping any component:
+All model settings are centralized in `pipeline_config.json`. To swap a model or change an endpoint, update only that file — no source code changes needed.
 
-### graph.py -- Pipeline Configuration Block
+### pipeline_config.json
 
-```python
-# -- Planner LLM --
-PLANNER_MODEL = "llama3"    # Any Ollama-pulled model name
-VISION_MODEL = "llava"      # LLaVA vision model for Stage 3 art direction
-OLLAMA_PORT = 11434         # Ollama API port
+```json
+{
+  "default_prompt": "A character performs a heavy broadsword swing.",
 
-# -- Motion Engine --
-MOTION_ENGINE_DIR = "/mnt/e/GenAnimPipeline/HY-Motion-1.0"
-MOTION_ENGINE_CHECKPOINT = "ckpts/tencent/HY-Motion-1.0"
-MOTION_ENGINE_SCRIPT = "local_infer.py"
+  "animation": {
+    "global_duration": 5,
+    "motion_seed": 999,
+    "motion_batch_size": 4
+  },
 
-# -- Vector Memory --
-MILVUS_HOST = "localhost"
-MILVUS_PORT = "19530"
-MILVUS_COLLECTION = "motion_corrections"
+  "ollama": {
+    "port": 11434,
+    "planner_model": "llama3:latest",
+    "vision_model": "llava:latest"
+  },
 
-# -- Critic Thresholds --
-CRITIC_SCORE_THRESHOLD = 0.85
-MAX_ITERATIONS = 3
+  "prompt_rewriter": "ollama",
+
+  "motion_engine": {
+    "dir": "HY-Motion-1.0",
+    "checkpoint": "ckpts/tencent/HY-Motion-1.0",
+    "script": "local_infer.py"
+  },
+
+  "milvus": {
+    "host": "localhost",
+    "port": "19530",
+    "collection": "motion_corrections"
+  },
+
+  "output": {
+    "fbx_path": "final_animation.fbx",
+    "bvh_path": "temp_motion.bvh",
+    "npz_path": "temp_motion.npz"
+  },
+
+  "mcp": { "server_port": 8000 },
+
+  "critic": {
+    "score_threshold": 0.85,
+    "max_iterations": 3
+  },
+
+  "logging": {
+    "level": "DEBUG",
+    "file": "pipeline.log"
+  }
+}
 ```
 
-### mcp_server/translate_to_fbx.py -- Server Configuration Block
+All output paths are relative to the project root — `pipeline/shared.py` resolves them to absolute paths at import time using `SCRIPT_DIR`.
+
+### mcp_server/translate_to_fbx.py — Server Configuration Block
 
 ```python
-BLENDER_EXE = r"D:\Blender Foundation\Blender 5.0\blender.exe"
+BLENDER_EXE    = r"D:\Blender Foundation\Blender 5.0\blender.exe"
 BLENDER_SCRIPT = r"E:\GenAnimPipeline\mcp_server\blender_retarget.py"
-SERVER_PORT = 8000
+SERVER_PORT    = 8000
 ```
 
 ### Quick Reference Table
 
-| What to swap | Config file | Variables | Notes |
-|---|---|---|---|
-| Planner LLM | `graph.py` | `PLANNER_MODEL`, `OLLAMA_PORT` | `ollama pull <model>` first; also upgrades Stage 2 critic |
-| Vision model (critic Stage 3) | `graph.py` | `VISION_MODEL` | `ollama pull llava:13b` etc.; any multimodal Ollama model |
-| Motion engine | `graph.py` | `MOTION_ENGINE_DIR`, `_CHECKPOINT`, `_SCRIPT` | Adapt prompt format in `generate_motion_node()` |
-| Motion engine variant | `graph.py` | `MOTION_ENGINE_CHECKPOINT` | e.g., `ckpts/tencent/HY-Motion-1.0-Lite` for lighter model |
-| Embedding model | `init_milvus.py` | `dim=384` field schema | Recreate Milvus collection if dimension changes |
-| Critic thresholds | `graph.py` | `CRITIC_SCORE_THRESHOLD`, `MAX_ITERATIONS` | Raise threshold for stricter gating; lower for faster iteration |
-| Blender version | `translate_to_fbx.py` | `BLENDER_EXE` | Check API compatibility for BVH/FBX ops |
-| MCP server port | Both files | `MCP_SERVER_PORT` / `SERVER_PORT` | Must match between `graph.py` and `translate_to_fbx.py` |
+| What to swap | Config location | Key(s) | CLI override | Notes |
+|---|---|---|---|---|
+| Planner / rewriter LLM | `pipeline_config.json` → `ollama` | `planner_model`, `port` | — | `ollama pull <model>` first; also upgrades Stage 2 critic and Ollama rewriter |
+| Prompt rewriter | `pipeline_config.json` | `prompt_rewriter` | `--rewriter ollama\|hymotion` | `ollama` enriches via Llama3 with Qwen3 fallback; `hymotion` delegates to internal rewriter |
+| Motion batch size | `pipeline_config.json` → `animation` | `motion_batch_size` | `--batch-size N` | Candidates scored by stages 1–3; winner forwarded to full critic cascade |
+| Default prompt | `pipeline_config.json` | `default_prompt` | `--prompt "..."` | Overrides the test prompt for a single run |
+| Vision model (critic Stage 3) | `pipeline_config.json` → `ollama` | `vision_model` | — | `ollama pull llava:13b` etc.; any multimodal Ollama model |
+| Motion engine | `pipeline_config.json` → `motion_engine` | `dir`, `checkpoint`, `script` | — | Adapt prompt format in `pipeline/nodes/motion.py` |
+| Motion engine variant | `pipeline_config.json` → `motion_engine` | `checkpoint` | — | e.g., `ckpts/tencent/HY-Motion-1.0-Lite` for lower VRAM |
+| Embedding model | `init_milvus.py` | `dim=384` field schema | — | Recreate Milvus collection if dimension changes |
+| Critic thresholds | `pipeline_config.json` → `critic` | `score_threshold`, `max_iterations` | — | Raise threshold for stricter gating; lower for faster iteration |
+| Blender version | `mcp_server/translate_to_fbx.py` | `BLENDER_EXE` | — | Check API compatibility for BVH/FBX ops |
+| MCP server port | `pipeline_config.json` → `mcp` + `translate_to_fbx.py` | `server_port` / `SERVER_PORT` | — | Must match between both files |
 
 ---
 
@@ -324,24 +364,62 @@ SERVER_PORT = 8000
 
 ```
 GenAnimPipeline/
-  graph.py                  # LangGraph orchestrator (main entry point)
-  init_milvus.py            # One-time Milvus collection setup
-  docker-compose.yml        # Milvus deployment (etcd + minio + milvus)
-  SETUP.md                  # Full deployment guide (Phases 1-7)
-  README.md                 # This file
+  graph.py                      # Thin LangGraph orchestrator (entry point, CLI args)
+  pipeline_config.json          # All hardcoded defaults — models, ports, paths, thresholds
+  init_milvus.py                # One-time Milvus collection setup
+  docker-compose.yml            # Milvus deployment (etcd + minio + milvus)
+  SETUP.md                      # Full deployment guide (Phases 1-7)
+  README.md                     # This file
+  pipeline/
+    __init__.py
+    shared.py                   # Config loader, logger, PipelineState, path helpers
+    smplh_adapter.py            # SmplhMocap adapter + FK helpers for NPZ evaluation
+    nodes/
+      __init__.py
+      memory.py                 # retrieve_context_node, update_memory_node
+      planner.py                # generate_symbolic_plan_node, Ollama rewriter, fallback alert
+      motion.py                 # generate_motion_node (batch scoring + best-of selection)
+      critic.py                 # Critic stages 1-4, score_candidate, evaluate_motion_node
+      mcp.py                    # execute_mcp_translation_node
   dashboard/
-    index.html              # Dashboard entry point (loads React, Tailwind, Three.js via CDN)
-    App.jsx                 # Single-file React dashboard application
-    server.py               # Dev server — serves dashboard + API for FBX file listing
+    index.html                  # Dashboard entry point (loads React, Tailwind, Three.js via CDN)
+    App.jsx                     # Single-file React dashboard application
+    server.py                   # Dev server — serves dashboard + API for FBX file listing
   mcp_server/
-    translate_to_fbx.py     # FastMCP Blender translation server
-    blender_retarget.py     # Blender Python script for BVH-to-FBX
-    venv/                   # Python venv for the MCP server
-  HY-Motion-1.0/            # Cloned motion generation model
-    local_infer.py          # Inference entry point
-    hymotion/               # Model source code (contains VRAM bypass patch)
-    ckpts/                  # Model checkpoints (CLIP, Qwen3-8B, DiT)
-  volumes/                  # Docker volumes for Milvus data persistence
+    translate_to_fbx.py         # FastMCP Blender translation server
+    blender_retarget.py         # Blender Python script for BVH-to-FBX
+    venv/                       # Python venv for the MCP server
+  HY-Motion-1.0/                # Cloned motion generation model
+    local_infer.py              # Inference entry point
+    hymotion/                   # Model source code (contains VRAM bypass patch)
+    ckpts/                      # Model checkpoints (CLIP, Qwen3-8B, DiT)
+  volumes/                      # Docker volumes for Milvus data persistence
+```
+
+### Standalone Module Testing
+
+Each `pipeline/nodes/` module has an `if __name__ == "__main__":` block with dummy or synthetic data so stages can be developed and debugged independently without running the full pipeline:
+
+```bash
+# Validate FK math with a synthetic NPZ (no real motion data needed)
+python -m pipeline.smplh_adapter
+
+# Test Milvus retrieval (graceful warning if Milvus is offline)
+python -m pipeline.nodes.memory
+
+# Test Ollama planner or hymotion passthrough
+python -m pipeline.nodes.planner
+python -m pipeline.nodes.planner --rewriter hymotion
+
+# Run critic stages 1-3 on a real or synthetic NPZ
+python -m pipeline.nodes.critic
+python -m pipeline.nodes.critic path/to/motion.npz
+
+# Print the inference command without executing (dry-run)
+python -m pipeline.nodes.motion
+
+# Check MCP/SSE connectivity to the Blender server
+python -m pipeline.nodes.mcp
 ```
 
 ## Dashboard
