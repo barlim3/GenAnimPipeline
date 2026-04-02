@@ -27,6 +27,7 @@ mcp_server/venv/
 .vs/
 .vscode/
 *.swp
+outputs/
 Thumbs.db
 Desktop.ini
 pipeline.log
