@@ -136,7 +136,18 @@ if __name__ == "__main__":
             "Prompt rewriter to use before motion generation. "
             "'ollama' (default) enriches the prompt via Llama3 on the Windows host and "
             "falls back to HY-Motion's internal Qwen3 rewriter if Ollama is unreachable. "
-            "'hymotion' delegates entirely to HY-Motion's internal rewriter (no fallback alert)."
+            "'hymotion' delegates entirely to HY-Motion's internal rewriter (no fallback alert). "
+            "When --engine kimodo is set, 'hymotion' is treated as no rewriter."
+        ),
+    )
+    parser.add_argument(
+        "--engine", type=str, default=None, choices=["hy-motion", "kimodo"],
+        help=(
+            "Motion generation backend to use. Overrides motion_engine.active in "
+            "pipeline_config.json for this run only. "
+            "'hy-motion' (default) uses HY-Motion-1.0 (outputs FBX + NPZ). "
+            "'kimodo' uses NVIDIA Kimodo (outputs BVH + NPZ; routes through Blender MCP for FBX). "
+            "Requires 'pip install kimodo[all]' and ~17 GB VRAM."
         ),
     )
     args = parser.parse_args()
@@ -154,11 +165,15 @@ if __name__ == "__main__":
         _planner_node.PROMPT_REWRITER = args.rewriter
         _motion_node.PROMPT_REWRITER  = args.rewriter
 
+    if args.engine is not None:
+        _cfg.ACTIVE_ENGINE = args.engine
+
     prompt = args.prompt if args.prompt is not None else DEFAULT_PROMPT
 
     logger.info("══════════════════════════════════════════════════════")
     logger.info("  GENERATIVE ANIMATION PIPELINE — STARTING")
     logger.info("  Prompt     : %s", prompt)
+    logger.info("  Engine     : %s", _cfg.ACTIVE_ENGINE)
     logger.info("  Rewriter   : %s", _cfg.PROMPT_REWRITER)
     logger.info("  Batch size : %d", _cfg.MOTION_BATCH_SIZE)
     logger.info("  Log file   : %s", _cfg.LOG_FILE)

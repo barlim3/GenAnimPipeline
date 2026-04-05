@@ -18,9 +18,23 @@
   "prompt_rewriter": "ollama",
 
   "motion_engine": {
-    "dir": "HY-Motion-1.0",
-    "checkpoint": "ckpts/tencent/HY-Motion-1.0",
-    "script": "local_infer.py"
+    "active": "kimodo",
+    "_comment_active": "Switch between 'hy-motion' and 'kimodo' to select the generation backend.",
+
+    "hy-motion": {
+      "dir": "HY-Motion-1.0",
+      "checkpoint": "ckpts/tencent/HY-Motion-1.0",
+      "script": "local_infer.py"
+    },
+
+    "kimodo": {
+      "model": "soma-rp-v1",
+      "_comment_model": "Available: soma-rp-v1, soma-seed-v1, g1-rp-v1, smplx-rp-v1",
+      "diffusion_steps": 100,
+      "cfg_weight": 7.5,
+      "output_bvh": true,
+      "_comment_bvh": "Kimodo has no native FBX exporter; BVH is routed through the Blender MCP fallback."
+    }
   },
 
   "milvus": {

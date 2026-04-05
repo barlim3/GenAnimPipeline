@@ -1,8 +1,21 @@
 # Multi-Agent Text-to-Motion Generative Pipeline: Deployment Guide
 
-This architecture utilizes a hybrid system: AI inference and multi-agent orchestration run within a Windows Subsystem for Linux (WSL2) environment, while native Windows acts as a hardware-accelerated fallback server for asset translation via Blender and the Model Context Protocol (MCP).
+This pipeline supports two deployment environments. Follow the path that matches your OS.
 
-All model-specific settings (LLM name, motion engine paths, service ports, etc.) are centralized in `pipeline_config.json` at the project root. To swap a model or change an endpoint, edit only that file — the pipeline flow stays untouched. Node implementations live in `pipeline/nodes/`; shared infrastructure (logger, config loader, path helpers) lives in `pipeline/shared.py`.
+| | **Windows + WSL2** *(recommended for Windows users)* | **Native Linux** |
+|---|---|---|
+| AI inference & orchestrator | WSL2 (Ubuntu) | Linux host |
+| Docker / Milvus | WSL2 via Docker Desktop | Native Docker |
+| Ollama + LLMs | Windows host | Linux host |
+| Blender + MCP server | Windows host | Linux host |
+| Dashboard | Any browser on Windows | Any browser on Linux |
+| Networking note | Ollama/MCP reached via Windows host gateway IP from WSL2 | All services on `localhost` |
+
+All model-specific settings are centralized in `pipeline_config.json`. Node implementations live in `pipeline/nodes/`; shared infrastructure lives in `pipeline/shared.py`.
+
+> **Switching motion engines:** `pipeline_config.json → motion_engine.active` controls whether HY-Motion-1.0 or Kimodo is used. Override for a single run with `--engine hy-motion` or `--engine kimodo`.
+
+---
 
 ## System Requirements
 
@@ -12,7 +25,7 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 
 *(Capable of running the pipeline, but generation times will be slower and background apps must be closed).*
 
-* **OS:** Windows 11 (build 22000 or higher) to properly support WSL2 GUI/GPU passthrough.
+* **OS:** Windows 11 (build 22000 or higher) **or** Ubuntu 20.04+ / Debian 11+.
 * **CPU:** 8-Core Processor (Intel i7 10th Gen / AMD Ryzen 7 5000 series).
 * **System RAM:** 16GB (requires manual memory management).
 * **GPU VRAM:** 12GB (NVIDIA RTX 3060 or 4070).
@@ -22,43 +35,68 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 
 *(Optimized for seamless orchestration, fast diffusion rendering, and background multi-tasking).*
 
-* **OS:** Windows 11.
+* **OS:** Windows 11 **or** Ubuntu 22.04 LTS.
 * **CPU:** 12-Core Processor or higher (Intel i9 13th Gen / AMD Ryzen 9 7000+).
-* **System RAM:** 32GB+ (Allows for a generous 24GB WSL2 allocation).
+* **System RAM:** 32GB+ (Windows: allows a generous 24GB WSL2 allocation; Linux: direct allocation).
 * **GPU VRAM:** 16GB+ (NVIDIA RTX 4080 Super or RTX 5070 Ti).
 * **Storage:** 100GB NVMe SSD.
-* **GPU Note (RTX 50-Series):** The Blackwell (sm_120) architecture strictly requires CUDA 13.0+ and the absolute latest Windows NVIDIA Game Ready/Studio drivers to function.
+* **GPU Note (RTX 50-Series):** The Blackwell (sm_120) architecture strictly requires CUDA 13.0+ and the latest NVIDIA drivers. On Linux, use the latest production driver from `graphics-drivers/ppa` or the NVIDIA `.run` installer.
 
 ---
 
 ## Phase 1: Core System Preparation
 
-### 1. Enable WSL2 and Optimize Memory
+### Windows + WSL2
 
-1. Open PowerShell as Administrator on Windows.
-2. Execute:
+1. Open PowerShell as Administrator and install WSL2:
    ```
    wsl --install
    ```
-3. Restart your computer and follow the prompts to create your Ubuntu credentials.
-4. **Expand WSL2 RAM Limit:** Open Windows File Explorer, navigate to `%userprofile%` (e.g., `C:\Users\YourName`), and create a file named `.wslconfig`. Add the following to give WSL2 enough breathing room for staging AI weights:
+2. Restart and follow the prompts to create your Ubuntu credentials.
+3. **Expand WSL2 RAM limit:** Navigate to `%userprofile%` in Explorer and create `.wslconfig`:
    ```ini
    [wsl2]
    memory=24GB
    ```
-5. Open PowerShell and run `wsl --shutdown` to apply.
+4. Apply with `wsl --shutdown` in PowerShell.
+5. Install native Windows dependencies:
+   * [**Python 3.10/3.11 for Windows**](https://www.python.org/downloads/windows/) — check "Add python.exe to PATH".
+   * [**Blender 4.0+**](https://www.blender.org/download/) — installs on Windows; used headlessly by the MCP server.
 
-### 2. Install Native Windows Dependencies
+### Native Linux
 
-* [**Python 3.10/3.11 for Windows**](https://www.python.org/downloads/windows/): Ensure you check the "Add python.exe to PATH" box during installation.
-* [**Blender 4.0+**](https://www.blender.org/download/): Install natively on your Windows drive (acting as the safety net for mesh binding).
+1. Install Python 3.10 or 3.11 and Blender:
+   ```bash
+   sudo apt update && sudo apt install -y python3.11 python3.11-venv python3-pip blender
+   ```
+   Or install Blender via the [official `.tar` release](https://www.blender.org/download/) for the latest version.
+2. Note the Blender executable path — you will need it in Phase 6:
+   ```bash
+   which blender   # typically /usr/bin/blender
+   ```
+3. No WSL2 or RAM limit configuration is needed — resource allocation is managed natively.
 
 ---
 
 ## Phase 2: Vector Memory (Milvus) Deployment
 
+#### Windows + WSL2
 1. Install [**Docker Desktop for Windows**](https://www.docker.com/products/docker-desktop/). Ensure the "Use the WSL 2 based engine" setting is checked.
 2. Open your Ubuntu (WSL2) terminal and run:
+
+#### Native Linux
+1. Install Docker Engine:
+   ```bash
+   curl -fsSL https://get.docker.com | sh
+   sudo usermod -aG docker $USER   # log out and back in after this
+   ```
+2. In your Linux terminal, run:
+
+---
+
+*(Both environments continue from here with the same commands.)*
+
+
    ```bash
    wget https://github.com/milvus-io/milvus/releases/download/v2.3.0/milvus-standalone-docker-compose.yml -O docker-compose.yml
    sudo docker compose up -d
@@ -111,34 +149,48 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 
 ## Phase 3: Semantic Planner (Ollama & Llama 3)
 
+#### Windows + WSL2
+
 1. Install [**Ollama for Windows**](https://ollama.com/).
-2. Open Windows "Environment Variables" and add a new System Variable:
+2. Open Windows "Environment Variables" and add a new System Variable so WSL2 can reach the Windows host:
    * **Variable name:** `OLLAMA_HOST`
    * **Variable value:** `0.0.0.0`
-3. Quit Ollama from your system tray, reopen it, and pull the two models the pipeline requires:
+3. Quit Ollama from your system tray, reopen it, and pull the required models in a Windows Command Prompt:
    ```
    ollama pull llama3
    ollama pull llava
    ```
-   `llama3` is the planner (Node 2) and the critic's semantic logician (Stage 2). `llava` is the critic's art director (Stage 3) -- it receives skeleton keyframe images for visual quality scoring. Pull `llava` once and Ollama serves it on demand via the same endpoint.
 
-   > **LLaVA VRAM:** LLaVA (7B) requires ~4-8 GB VRAM. Like the planner, the critic passes `"keep_alive": 0` so Ollama releases it immediately after scoring. If VRAM is tight, set `OLLAMA_NUM_GPU=0` to run LLaVA on CPU -- inference will be slower (~10-30s per evaluation) but the result is the same.
-   >
-   > **Swapping the vision model:** To use a larger or different multimodal model (e.g., `llava:13b`, `bakllava`), pull it and update `vision_model` under `ollama` in `pipeline_config.json`.
+#### Native Linux
 
-> **Swapping the planner model:** To use a different LLM (e.g., Mistral, Gemma2, Phi3), pull it with `ollama pull <model>` and update `planner_model` under `ollama` in `pipeline_config.json`. No other code changes are needed.
-
-> **VRAM isolation (optional):** The planner and HY-Motion share the same physical GPU. By default, `graph.py` passes `"keep_alive": 0` in the Ollama request to immediately free VRAM after planning. For full GPU isolation, add a second system environment variable alongside `OLLAMA_HOST`:
-> * **Variable name:** `OLLAMA_NUM_GPU`
-> * **Variable value:** `0`
->
-> This forces Ollama to run entirely on CPU. The planner task is lightweight (one short JSON response), so CPU inference adds only 2-3 seconds -- negligible compared to the diffusion pass.
+1. Install Ollama:
+   ```bash
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+   Ollama runs as a systemd service and listens on `localhost:11434` — no `OLLAMA_HOST` variable needed.
+2. Pull the required models:
+   ```bash
+   ollama pull llama3
+   ollama pull llava
+   ```
 
 ---
 
-## Phase 4: Deep Learning Environment (WSL2)
+`llama3` is used by the planner (Node 2) and the critic's semantic logician (Stage 2). `llava` is the critic's art director (Stage 3) — it receives rendered skeleton keyframe images for visual quality scoring.
 
-1. In your Ubuntu terminal, install Miniconda:
+> **LLaVA VRAM:** LLaVA (7B) requires ~4-8 GB VRAM. The critic passes `"keep_alive": 0` so Ollama releases it immediately after scoring. If VRAM is tight, set `OLLAMA_NUM_GPU=0` to run LLaVA on CPU — inference will be slower (~10-30s per evaluation) but the result is the same.
+
+> **Swapping models:** Pull any Ollama-compatible model and update `ollama.planner_model` or `ollama.vision_model` in `pipeline_config.json`. No code changes needed.
+
+> **VRAM isolation (optional):** Set the environment variable `OLLAMA_NUM_GPU=0` to force CPU-only Ollama inference. The planner task is lightweight (one short JSON response), so CPU mode adds only ~2-3 seconds per run.
+
+---
+
+## Phase 4: Deep Learning Environment
+
+*(Both environments follow the same steps — WSL2 users run these in their Ubuntu terminal; native Linux users run them directly.)*
+
+1. Install Miniconda:
    ```bash
    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
    bash Miniconda3-latest-Linux-x86_64.sh
@@ -157,9 +209,13 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
    ```bash
    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130 --upgrade --force-reinstall
    pip install "numpy<2.0"
-   pip install transformers tokenizers accelerate bitsandbytes triton huggingface_hub langgraph langchain-community requests mcp
+   pip install transformers tokenizers "accelerate>=0.29.0" bitsandbytes triton huggingface_hub langgraph langchain-community requests mcp
    pip install bvh matplotlib sentence-transformers
    ```
+
+   > **`accelerate` version requirement:** `sentence_transformers` pulls in `peft` as an indirect dependency. `peft>=0.7` requires `accelerate>=0.29.0` for `clear_device_cache`. Pinning `accelerate>=0.29.0` above prevents an `ImportError: cannot import name 'clear_device_cache'` on pipeline startup. If you see this error in an existing environment, fix it with `pip install --upgrade accelerate`.
+
+   > **RTX 30/40-series:** Use the stable PyTorch release instead: `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
 
 ---
 
@@ -167,8 +223,22 @@ Due to the heavy use of local Diffusion Transformers and Large Language Models, 
 
 ### 1. Clone and Pull Real Assets
 
-1. Clone the HY-Motion 1.0 [Repository](https://github.com/Tencent-Hunyuan/HY-Motion-1.0.git) to your Windows drive via WSL2 (e.g., `/mnt/e/GenAnimPipeline/HY-Motion-1.0`).
-2. Navigate into the folder: `cd /mnt/e/GenAnimPipeline/HY-Motion-1.0`.
+Clone into the directory that matches your environment:
+
+| Environment | Recommended clone path |
+|---|---|
+| Windows + WSL2 | `/mnt/e/GenAnimPipeline/HY-Motion-1.0` (on the Windows drive, accessible from both sides) |
+| Native Linux | `~/GenAnimPipeline/HY-Motion-1.0` |
+
+1. Clone the HY-Motion 1.0 [Repository](https://github.com/Tencent-Hunyuan/HY-Motion-1.0.git) to your chosen path.
+2. Navigate into the folder (adjust for your environment):
+   ```bash
+   # Windows + WSL2
+   cd /mnt/e/GenAnimPipeline/HY-Motion-1.0
+
+   # Native Linux
+   cd ~/GenAnimPipeline/HY-Motion-1.0
+   ```
 3. Pull the actual 3D mesh files to replace Git LFS text pointers:
    ```bash
    git lfs pull
@@ -221,15 +291,49 @@ To prevent VRAM explosion, we must bypass HY-Motion's internal 40GB LLM and set 
 
 ---
 
-## Phase 6: Windows Translation Server (FastMCP Safety Net)
+## Phase 6: BVH-to-FBX Translation Server (FastMCP Safety Net)
 
-This natively runs Blender on Windows to bind the mesh if HY-Motion's native .fbx exporter fails and falls back to .bvh.
+This phase sets up the FastMCP Blender server that converts `.bvh` files to `.fbx` when the motion engine doesn't produce a native FBX (e.g., when using Kimodo, or when HY-Motion's FBX exporter fails).
+
+#### Windows + WSL2
 
 1. Create a directory on your Windows drive (e.g., `E:\GenAnimPipeline\mcp_server`).
-2. Open a Windows Command Prompt, navigate to the folder, and setup the environment:
+2. Open a **Windows** Command Prompt, navigate to the folder, and set up the environment:
    ```
    python -m venv venv
    venv\Scripts\activate
+   pip install fastmcp
+   ```
+
+> **Note for WSL2 users:** The MCP server runs on Windows so that Blender can access the GPU natively. The WSL2 orchestrator reaches it via the Windows host gateway IP, resolved at runtime by `get_windows_host_ip()` in `pipeline/shared.py`.
+
+#### Native Linux
+
+1. Navigate to `~/GenAnimPipeline/mcp_server` (or create it).
+2. Set up the environment in a Linux terminal:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install fastmcp
+   ```
+3. In `translate_to_fbx.py`, update the configuration block to use your Linux Blender path:
+   ```python
+   BLENDER_EXE = "/usr/bin/blender"          # or full path from `which blender`
+   BLENDER_SCRIPT = "/home/user/GenAnimPipeline/mcp_server/blender_retarget.py"
+   SERVER_PORT = 8000
+   ```
+4. The server and orchestrator both run on the same machine, so `mcp.server_port` in `pipeline_config.json` points to `localhost:8000` — no host IP resolution needed.
+
+> **Note for Linux users:** `pipeline/nodes/mcp.py` builds the server URL using `get_windows_host_ip()` under WSL2 and `localhost` on native Linux. If you're on native Linux and the MCP node fails to connect, confirm the server is running and that `mcp.server_port` in `pipeline_config.json` matches `SERVER_PORT` in `translate_to_fbx.py`.
+
+---
+
+*(Both environments continue below with the same server files.)*
+
+1. In the `mcp_server` directory, set up the Python environment:
+   ```bash
+   # Windows: venv\Scripts\activate
+   # Linux:   source venv/bin/activate
    pip install fastmcp
    ```
 3. Create `translate_to_fbx.py` in this folder (or use the existing file):
@@ -360,9 +464,12 @@ This natively runs Blender on Windows to bind the mesh if HY-Motion's native .fb
 
 ---
 
-## Phase 7: The Master LangGraph Orchestrator (WSL2)
+## Phase 7: The Master LangGraph Orchestrator
 
 The pipeline entry point is `graph.py`, but it is now a thin orchestrator — it only wires nodes into the LangGraph graph and handles CLI arguments. All node logic lives in the `pipeline/` package.
+
+> **WSL2 users:** run all commands below in your Ubuntu terminal with the `text2motion` conda environment active.
+> **Native Linux users:** run them in any terminal in the same conda environment.
 
 ### Project Layout
 
@@ -404,9 +511,18 @@ All model and service settings live in `pipeline_config.json`. To swap any model
   "prompt_rewriter": "ollama",
 
   "motion_engine": {
-    "dir": "HY-Motion-1.0",
-    "checkpoint": "ckpts/tencent/HY-Motion-1.0",
-    "script": "local_infer.py"
+    "active": "hy-motion",
+    "hy-motion": {
+      "dir": "HY-Motion-1.0",
+      "checkpoint": "ckpts/tencent/HY-Motion-1.0",
+      "script": "local_infer.py"
+    },
+    "kimodo": {
+      "model": "soma-rp-v1",
+      "diffusion_steps": 100,
+      "cfg_weight": 7.5,
+      "output_bvh": true
+    }
   },
 
   "milvus": {
@@ -436,6 +552,17 @@ All model and service settings live in `pipeline_config.json`. To swap any model
 ```
 
 All output paths are relative to the project root. `pipeline/shared.py` resolves them to absolute paths at import time, so the pipeline works regardless of where the repo is cloned.
+
+**Environment-specific notes for `pipeline_config.json`:**
+
+| Setting | Windows + WSL2 | Native Linux |
+|---|---|---|
+| `motion_engine.hy-motion.dir` | Relative to project root — no change needed | Same |
+| `milvus.host` | `"localhost"` — Docker Desktop bridges WSL2 | `"localhost"` |
+| `mcp.server_port` | Must match `SERVER_PORT` in `mcp_server/translate_to_fbx.py` on Windows | Same, but server runs on Linux localhost |
+| `ollama.port` | `11434` — Windows host IP resolved at runtime | `11434` on localhost |
+
+> **WSL2 only:** `pipeline/shared.py` calls `get_windows_host_ip()` (via `ip route`) to reach Ollama and the MCP server running on the Windows host. This is automatic — no config change needed. On native Linux all services are on `localhost` and this helper is not invoked.
 
 ### Pipeline Flow
 
@@ -486,85 +613,131 @@ python -m pipeline.nodes.mcp                            # SSE connectivity check
 
 ## Daily Execution: Startup Sequence
 
-When sitting down to use the pipeline, follow this exact boot sequence to ensure the virtual networks bridge correctly.
+Follow the sequence for your environment. All steps that are identical between environments are listed once.
 
-### Step 1: Ignite the Background Services (Windows/WSL)
+---
 
-1. Ensure the **Ollama** app is running in your Windows system tray and run `ollama run llama3` in a Windows Command Prompt.
-   ```bash
-   ollama run llama3
-   ollama run llava
-   ```
-2. Open a WSL2 (Ubuntu) terminal and start your Milvus memory database:
-   ```bash
-   sudo docker compose up -d
-   ```
+### Windows + WSL2
 
-### Step 2: Boot the Translation Bridge (Windows Native)
+Open **three separate terminal windows** — one Windows Command Prompt for services, one for the orchestrator (WSL2 Ubuntu), and optionally one for the dashboard.
 
-Open a standard Windows Command Prompt to start the FastMCP safety net. *Leave this window open in the background.*
+**Terminal 1 — Windows Command Prompt (Ollama + MCP server)**
 
 ```
+:: 1. Ensure Ollama is running in the system tray, then warm up the models:
+ollama run llama3
+ollama run llava
+
+:: 2. Start the Blender MCP translation server (leave this running):
 cd E:\GenAnimPipeline\mcp_server
 venv\Scripts\activate
 python translate_to_fbx.py
 ```
 
-### Step 3: Launch the Dashboard (Windows — Optional)
-
-Open a Windows Command Prompt or PowerShell to start the browser-based GUI. *Leave this window open in the background.*
+**Terminal 2 — Windows Command Prompt (Dashboard — Optional)**
 
 ```
 cd E:\GenAnimPipeline\dashboard
 python server.py
 ```
 
-Open `http://localhost:8080` in your browser. The dashboard provides a 3D viewport for previewing FBX output, pipeline node controls, and a terminal console. Select any `.fbx` file from the viewport dropdown to load and loop its animation.
+Open `http://localhost:8080` in your browser.
 
-> **No build step required.** The dashboard loads React, Tailwind CSS, and Three.js from CDNs. Only Python (already installed for the MCP server) is needed to run `server.py`.
-
-### Step 4: Trigger the Orchestrator (WSL2)
-
-Open your WSL2 terminal, activate the PyTorch cu130 environment, and launch the workflow. Ensure `pipeline_config.json` is configured to your desired values before running.
+**Terminal 3 — WSL2 Ubuntu (Milvus + Orchestrator)**
 
 ```bash
+# Start Milvus vector database
+sudo docker compose up -d
+
+# Activate the AI environment and run the pipeline
 conda activate text2motion
 cd /mnt/e/GenAnimPipeline
 python graph.py
 ```
 
-**CLI arguments** — all are optional and override the corresponding config value for that run only:
+---
+
+### Native Linux
+
+Open **two terminal windows** — one for background services, one for the orchestrator.
+
+**Terminal 1 — Background Services (Ollama + Milvus + MCP server)**
+
+```bash
+# 1. Ollama (if not already running as a systemd service)
+ollama serve &
+
+# 2. Warm up models
+ollama run llama3
+ollama run llava
+
+# 3. Start Milvus vector database
+sudo docker compose up -d
+
+# 4. Start the Blender MCP translation server (leave this running)
+cd ~/GenAnimPipeline/mcp_server
+source venv/bin/activate
+python translate_to_fbx.py
+```
+
+**Terminal 2 — Dashboard (Optional)**
+
+```bash
+cd ~/GenAnimPipeline/dashboard
+python server.py
+```
+
+Open `http://localhost:8080` in your browser.
+
+**Terminal 3 — Orchestrator**
+
+```bash
+conda activate text2motion
+cd ~/GenAnimPipeline
+python graph.py
+```
+
+---
+
+**CLI arguments** — all are optional and override the corresponding `pipeline_config.json` value for that run only:
 
 | Argument | Values | Default | Description |
 |---|---|---|---|
-| `--prompt "..."` | any string | `DEFAULT_PROMPT` | Motion description to generate |
-| `--batch-size N` | integer | `MOTION_BATCH_SIZE` (4) | Number of motion candidates HY-Motion generates; best scorer is kept |
-| `--rewriter` | `ollama` \| `hymotion` | `PROMPT_REWRITER` (`ollama`) | Prompt rewriter to use before generation. `ollama` enriches via Llama3 and falls back to HY-Motion's internal Qwen3 rewriter if unreachable (red alert logged). `hymotion` delegates entirely to the internal rewriter with no fallback alert |
+| `--prompt "..."` | any string | `default_prompt` | Motion description to generate |
+| `--batch-size N` | integer | `motion_batch_size` (4) | Candidates generated; best scorer is kept (HY-Motion only; Kimodo takes first) |
+| `--engine` | `hy-motion` \| `kimodo` | `motion_engine.active` | Select motion generation backend for this run |
+| `--rewriter` | `ollama` \| `hymotion` | `prompt_rewriter` | Prompt enrichment strategy. `ollama` uses Llama3 with Qwen3 fallback; `hymotion` delegates to HY-Motion's internal rewriter. Kimodo ignores `hymotion` and uses no rewriter |
 
 Examples:
 ```bash
 # Single candidate, fast iteration
 python graph.py --batch-size 1
 
+# Switch to Kimodo for one run without changing the config
+python graph.py --engine kimodo --prompt "A person waves hello"
+
 # Use HY-Motion's internal Qwen3 rewriter instead of Ollama
 python graph.py --rewriter hymotion
 
-# Full override: custom prompt, 8 candidates, Ollama rewriter
-python graph.py --prompt "A character vaults over an obstacle" --batch-size 8 --rewriter ollama
+# Full override
+python graph.py --prompt "A character vaults over an obstacle" --batch-size 8 --engine hy-motion --rewriter ollama
 ```
 
 ---
 
-## Quick Reference: Swapping Models
+## Quick Reference: Swapping Models & Configuration
 
-| What to swap | Config location | Key(s) to change |
+| What to change | Config location | Key(s) |
 |---|---|---|
-| Planner LLM | `pipeline_config.json` → `ollama` | `planner_model`, `port` |
-| Prompt rewriter | `pipeline_config.json` or `--rewriter` CLI arg | `prompt_rewriter` (`"ollama"` or `"hymotion"`) |
-| Motion batch size | `pipeline_config.json` → `animation` or `--batch-size` CLI arg | `motion_batch_size` (default `4`) |
-| Critic vision model (Stage 3) | `pipeline_config.json` → `ollama` | `vision_model` (e.g. `"llava:13b"`, `"bakllava"`) |
-| Critic score threshold | `pipeline_config.json` → `critic` | `score_threshold` (default `0.85`) |
-| Motion engine | `pipeline_config.json` → `motion_engine` | `dir`, `checkpoint`, `script` (+ prompt format in `pipeline/nodes/motion.py`) |
-| Vector database | `pipeline_config.json` → `milvus` | `host`, `port`, `collection` |
-| Blender version | `mcp_server/translate_to_fbx.py` | `BLENDER_EXE` |
-| MCP server port | `pipeline_config.json` → `mcp` + `translate_to_fbx.py` | `server_port` / `SERVER_PORT` (must match) |
+| **Active motion engine** | `pipeline_config.json → motion_engine.active` or `--engine` CLI | `"hy-motion"` or `"kimodo"` |
+| Kimodo model variant | `pipeline_config.json → motion_engine.kimodo` | `model` (e.g. `"soma-rp-v1"`, `"g1-rp-v1"`, `"smplx-rp-v1"`) |
+| Kimodo quality vs speed | `pipeline_config.json → motion_engine.kimodo` | `diffusion_steps` (fewer = faster, lower quality) |
+| HY-Motion checkpoint | `pipeline_config.json → motion_engine.hy-motion` | `checkpoint` (e.g. `"ckpts/tencent/HY-Motion-1.0-Lite"` for lower VRAM) |
+| Planner LLM | `pipeline_config.json → ollama` | `planner_model`, `port` |
+| Prompt rewriter | `pipeline_config.json` or `--rewriter` | `prompt_rewriter` (`"ollama"` or `"hymotion"`) |
+| Motion batch size | `pipeline_config.json → animation` or `--batch-size` | `motion_batch_size` (default `4`; applies to HY-Motion only) |
+| Critic vision model (Stage 3) | `pipeline_config.json → ollama` | `vision_model` (e.g. `"llava:13b"`, `"bakllava"`) |
+| Critic score threshold | `pipeline_config.json → critic` | `score_threshold` (default `0.85`) |
+| Vector database | `pipeline_config.json → milvus` | `host`, `port`, `collection` |
+| Blender executable | `mcp_server/translate_to_fbx.py` | `BLENDER_EXE` (Windows: full `.exe` path; Linux: `/usr/bin/blender` or `which blender`) |
+| MCP server port | `pipeline_config.json → mcp` **and** `translate_to_fbx.py` | `server_port` / `SERVER_PORT` — must match in both files |

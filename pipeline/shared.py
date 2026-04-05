@@ -44,9 +44,23 @@ OLLAMA_PORT: int           = cfg["ollama"]["port"]
 
 PROMPT_REWRITER: str       = cfg["prompt_rewriter"]
 
-MOTION_ENGINE_DIR: str     = os.path.join(SCRIPT_DIR, cfg["motion_engine"]["dir"])
-MOTION_ENGINE_CHECKPOINT: str = cfg["motion_engine"]["checkpoint"]
-MOTION_ENGINE_SCRIPT: str  = cfg["motion_engine"]["script"]
+# ── Motion engine selection ───────────────────────────────────────────────────
+# Set active_engine to "hy-motion" or "kimodo" in pipeline_config.json, or
+# override at runtime via graph.py --engine.  All engine-specific constants are
+# read here so every module stays in sync after a CLI override.
+
+ACTIVE_ENGINE: str         = cfg["motion_engine"]["active"]   # "hy-motion" | "kimodo"
+
+_hym = cfg["motion_engine"]["hy-motion"]
+MOTION_ENGINE_DIR: str        = os.path.join(SCRIPT_DIR, _hym["dir"])
+MOTION_ENGINE_CHECKPOINT: str = _hym["checkpoint"]
+MOTION_ENGINE_SCRIPT: str     = _hym["script"]
+
+_kim = cfg["motion_engine"]["kimodo"]
+KIMODO_MODEL: str          = _kim["model"]
+KIMODO_DIFFUSION_STEPS: int = int(_kim["diffusion_steps"])
+KIMODO_CFG_WEIGHT: float   = float(_kim["cfg_weight"])
+KIMODO_OUTPUT_BVH: bool    = bool(_kim["output_bvh"])
 
 MILVUS_HOST: str           = cfg["milvus"]["host"]
 MILVUS_PORT: str           = cfg["milvus"]["port"]
@@ -144,4 +158,5 @@ ANSI_BOLD  = "\033[1m"
 ANSI_RESET = "\033[0m"
 
 # ── Pass duration to HY-Motion's patched prompt_rewrite.py ───────────────────
+# Only meaningful when the active engine is hy-motion, but harmless to always set.
 os.environ["HY_MOTION_DURATION"] = str(GLOBAL_DURATION)

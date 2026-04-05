@@ -60,19 +60,29 @@ graph TD
 ```
 ## Architecture Overview
 
-The pipeline runs as a hybrid WSL2/Windows system:
+The pipeline supports two deployment environments. Both are fully supported; choose based on your OS.
 
-| Component | Runs On | Purpose |
+| | **Windows + WSL2** *(recommended for Windows users)* | **Native Linux** |
 |---|---|---|
-| `graph.py` (LangGraph) | WSL2 | Thin orchestrator — wires nodes into the directed graph, handles CLI args |
-| `pipeline/` modules | WSL2 | Node implementations, SMPL-H adapter, shared config and logger |
-| `pipeline_config.json` | WSL2 | All hardcoded defaults — models, ports, paths, thresholds |
-| Milvus vector database | WSL2 (Docker) | Stores motion correction embeddings for context retrieval |
-| Ollama + Llama 3 | Windows host | Decomposes prompts into structured motion plans |
-| HY-Motion-1.0 | WSL2 | Diffusion transformer that generates 3D skeleton animation |
-| Blender + FastMCP server | Windows host | Safety-net BVH-to-FBX converter (only when needed) |
+| Orchestrator + AI inference | WSL2 (Ubuntu) | Linux host |
+| Docker / Milvus | WSL2 via Docker Desktop | Native Docker |
+| Ollama + LLMs | Windows host (accessed via host gateway IP) | Linux host (localhost) |
+| Blender + MCP server | Windows host | Linux host |
+| Dashboard | Windows (any browser) | Linux (any browser) |
 
-All model-specific settings are centralized in `pipeline_config.json`. To swap a model or change an endpoint, edit only that file — the pipeline flow stays untouched. See [Model Configuration](#model-configuration) for details.
+### Component Responsibilities
+
+| Component | Purpose |
+|---|---|
+| `graph.py` (LangGraph) | Thin orchestrator — wires nodes into the directed graph, handles CLI args |
+| `pipeline/` modules | Node implementations, SMPL-H adapter, shared config and logger |
+| `pipeline_config.json` | All hardcoded defaults — models, ports, paths, thresholds |
+| Milvus vector database | Stores motion correction embeddings for context retrieval |
+| Ollama + Llama 3 / LLaVA | Prompt planning (Node 2) and visual critic (Stage 3) |
+| HY-Motion-1.0 or Kimodo | Diffusion transformer that generates 3D skeleton animation |
+| Blender + FastMCP server | Safety-net BVH-to-FBX converter (only triggered when no native FBX is produced) |
+
+All model-specific settings are centralized in `pipeline_config.json`. To swap a model, change an endpoint, or switch motion engines, edit only that file — the pipeline flow stays untouched. See [Model Configuration](#model-configuration) for details.
 
 ---
 
